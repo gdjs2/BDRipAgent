@@ -47,10 +47,17 @@ from shared.models import (
     TrackSelection,
     now,
 )
-from shared.naming import release_name, source_description
-from shared.paths import contained, job_dir
-from shared.screenshot_rules import check_manual_spacing, check_other_variants, is_b_frame_pair
+from shared.naming import release_name, source_description, track_name
+from shared.paths import artifact_root, contained, job_dir
+from shared.screenshot_rules import (
+    check_manual_spacing,
+    check_other_variants,
+    is_b_frame_pair,
+    other_variant_frames,
+    reservation_for,
+)
 from shared.state import Stage, require_stage
+from shared.tracks import FLAG_NAMES
 
 DB = Annotated[Session, Depends(get_db)]
 
@@ -311,6 +318,22 @@ def tracks(job_id: UUID, db: DB):
     return [serialize(t) for t in db.scalars(select(MovieTrack).where(MovieTrack.job_id == str(job_id)))]
 
 
+@api.post("/jobs/{job_id}/tracks/analyze", status_code=202)
+def analyze_tracks(job_id: UUID, db: DB):
+    job = get_job(db, str(job_id), lock=True)
+    require_stage(job.state, Stage.WAITING_FOR_TRACK_SELECTION)
+    if db.scalar(select(Task).where(Task.job_id == job.id, Task.status.in_(["QUEUED", "RUNNING"]))):
+        raise ValueError("Wait for the active task before analyzing subtitles")
+    if db.scalar(select(TrackSelection).where(TrackSelection.job_id == job.id)):
+        raise ValueError("Tracks have already been selected")
+    job.state = Stage.ANALYZING_SOURCE.value
+    event(db, job.id, "state_changed", state=job.state)
+    enqueue(db, job)
+    db.commit()
+    manifest(db, job)
+    return job_detail(db, job)
+
+
 @api.post("/jobs/{job_id}/tracks/selection")
 def select_tracks(job_id: UUID, body: SelectTracks, db: DB):
     job = get_job(db, str(job_id), lock=True)
@@ -324,7 +347,34 @@ def select_tracks(job_id: UUID, body: SelectTracks, db: DB):
     for track_id in body.subtitle_track_ids:
         if track_id not in tracks or tracks[track_id].info.get("codec_id") != "S_HDMV/PGS":
             raise ValueError(f"Track {track_id} is not a PGS subtitle")
-    db.add(TrackSelection(job_id=job.id, **body.model_dump()))
+    chosen = set(body.audio_track_ids + body.subtitle_track_ids)
+    updated = {}
+    for track_id in chosen:
+        track = tracks[track_id]
+        info = {**track.info}
+        if track_id in body.track_names:
+            info["name_override"] = body.track_names[track_id]
+        if track_id in body.track_flags:
+            flags = {**info.get("flag_overrides", {}), **body.track_flags[track_id]}
+            info.update(flags)
+            info["flag_overrides"] = flags
+        if info.get("track_review", {}).get("schema_version") == 1:
+            unresolved = [flag for flag in FLAG_NAMES if not isinstance(info.get(flag), bool)]
+            if unresolved:
+                raise ValueError(
+                    f"Track {track_id}: choose unresolved flags before continuing: {', '.join(unresolved)}"
+                )
+        if track_id in body.track_names or track_id in body.track_flags:
+            info["mux_name"] = track_name({**info, "kind": track.kind})
+        track.info = info
+        updated[track_id] = info
+    job.analysis = {
+        **job.analysis,
+        "tracks": [
+            {**track, **updated.get(track["track_id"], {})} for track in job.analysis.get("tracks", [])
+        ],
+    }
+    db.add(TrackSelection(job_id=job.id, **body.model_dump(exclude={"track_names", "track_flags"})))
     advance(db, job)
     db.commit()
     manifest(db, job)
@@ -389,7 +439,7 @@ def start_smoke_test(job_id: UUID, db: DB):
         )
     )
     job.analysis = {**job.analysis, "smoke_test": True}
-    job.release_name = "SMOKE-TEST." + job.release_name[:220]
+    job.release_name = "SMOKE-TEST." + job.release_name.removesuffix("-WiKi")[:220] + "-WiKi"
     event(db, job.id, "smoke_test_selected", source_video_reused=True, encode_validation_skipped=True)
     advance(db, job)
     db.commit()
@@ -437,16 +487,33 @@ for route, stage in [
 
 @api.get("/jobs/{job_id}/screenshots")
 def screenshots(job_id: UUID, db: DB):
-    get_job(db, str(job_id))
+    job = get_job(db, str(job_id))
     rows = db.scalars(
         select(Screenshot).where(Screenshot.job_id == str(job_id)).order_by(Screenshot.candidate_id)
     ).all()
+    reserved = other_variant_frames(db, job)
+    items = []
+    for row in rows:
+        match = reservation_for(row.info, reserved)
+        items.append(
+            {
+                **serialize(row),
+                "reservation": {
+                    "job_id": match["job_id"],
+                    "codec": match["codec"],
+                    "frame_number": match["source_frame_number"],
+                    "spacing_seconds": match["spacing"],
+                }
+                if match
+                else None,
+            }
+        )
     return {
         "candidates": len(rows),
         "shortlisted": sum(r.shortlisted for r in rows),
         "recommended": sum(bool(r.info.get("recommendation_rank")) for r in rows),
         "final": sum(r.selected for r in rows),
-        "items": [serialize(r) for r in rows],
+        "items": items,
     }
 
 
@@ -654,7 +721,7 @@ def generate_release(job_id: UUID, body: ReleaseDetails, db: DB):
     job = get_job(db, str(job_id), lock=True)
     editable_release(db, job)
     selected_pairs(db, job, get_settings())
-    if not get_settings().tu_ttg_token.get_secret_value().strip():
+    if body.upload_screenshots and not get_settings().tu_ttg_token.get_secret_value().strip():
         raise ValueError(
             "Set TU_TTG_TOKEN in .env and restart the API and worker to enable screenshot uploads"
         )
@@ -712,6 +779,38 @@ def retry(task_id: UUID, db: DB):
     return serialize(result)
 
 
+def set_encoding_pause(db, task_id, paused):
+    task = get_task(db, task_id)
+    job = get_job(db, task.job_id, lock=True)
+    task = db.scalar(
+        select(Task).where(Task.id == task.id).with_for_update().execution_options(populate_existing=True)
+    )
+    if (
+        task.type != "encode"
+        or task.status != "RUNNING"
+        or job.state != Stage.ENCODING
+        or task.cancel_requested
+    ):
+        raise ValueError("Only an active encoding task can be paused or resumed")
+    if not task.can_pause:
+        raise ValueError("The encoder is not ready for pause/resume, or its worker does not support it")
+    if task.pause_requested != paused:
+        task.pause_requested = paused
+        event(db, task.job_id, "task_pause_requested", task_id=task.id, paused=paused)
+        db.commit()
+    return serialize(task)
+
+
+@api.post("/tasks/{task_id}/pause", status_code=202)
+def pause_encoding(task_id: UUID, db: DB):
+    return set_encoding_pause(db, task_id, True)
+
+
+@api.post("/tasks/{task_id}/resume", status_code=202)
+def resume_encoding(task_id: UUID, db: DB):
+    return set_encoding_pause(db, task_id, False)
+
+
 @api.post("/tasks/{task_id}/cancel")
 def cancel(task_id: UUID, db: DB):
     task = get_task(db, task_id)
@@ -744,17 +843,83 @@ def logs(task_id: UUID, db: DB, offset: int = 0, limit: int = 65536, tail: bool 
         return {"text": text.decode(errors="replace"), "offset": stream.tell()}
 
 
+@api.get("/tasks/{task_id}/agent-events")
+async def agent_events(task_id: UUID, request: Request, db: DB):
+    task = get_task(db, task_id)
+    job_id = task.job_id
+    try:
+        cursor = int(request.headers.get("last-event-id", "0"))
+        if not 0 <= cursor <= 2**63 - 1:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, "Invalid Last-Event-ID") from None
+    db.close()
+
+    async def stream():
+        nonlocal cursor
+        while not await request.is_disconnected():
+            with session() as event_db:
+                rows = event_db.scalars(
+                    select(Event)
+                    .where(
+                        Event.job_id == job_id,
+                        Event.type == "agent_output",
+                        Event.id > cursor,
+                        Event.data["task_id"].as_string() == str(task_id),
+                    )
+                    .order_by(Event.id)
+                    .limit(200)
+                ).all()
+                current = event_db.get(Task, str(task_id))
+                active = current is not None and current.status in ("QUEUED", "RUNNING")
+            for row in rows:
+                cursor = row.id
+                yield f"id: {row.id}\nevent: agent_output\ndata: {json.dumps(row.data)}\n\n"
+            if not rows and not active:
+                yield "event: terminal\ndata: {}\n\n"
+                return
+            if not rows:
+                yield ": heartbeat\n\n"
+            await asyncio.sleep(0.05 if rows else 0.5)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@api.get("/artifacts/{artifact_id}/preview")
+def artifact_preview(artifact_id: UUID, db: DB):
+    item = db.get(Artifact, str(artifact_id))
+    if not item:
+        raise LookupError("Artifact not found")
+    get_job(db, item.job_id)
+    if item.artifact_type not in ("RELEASE_BBCODE", "RELEASE_NFO", "RELEASE_MD5", "RELEASE_ENCODER_INFO"):
+        raise ValueError("This artifact is not a release text file")
+    root = artifact_root(get_settings(), item.job_id, item.storage)
+    path = contained(root, item.path, exists=True)
+    limit = 1024 * 1024
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    encoding = "cp437" if item.artifact_type == "RELEASE_NFO" else "utf-8-sig"
+    return {
+        "filename": path.name,
+        "text": data[:limit].decode(encoding, errors="replace"),
+        "truncated": len(data) > limit,
+    }
+
+
 @api.get("/artifacts/{artifact_id}")
 def artifact(artifact_id: UUID, db: DB):
     artifact = db.get(Artifact, str(artifact_id))
     if not artifact:
         raise LookupError("Artifact not found")
     get_job(db, artifact.job_id)
-    root = (
-        get_settings().completed_root
-        if artifact.storage == "completed"
-        else job_dir(get_settings().workspace_root, artifact.job_id)
-    )
+    root = artifact_root(get_settings(), artifact.job_id, artifact.storage)
     path = contained(root, artifact.path, exists=True)
     return FileResponse(
         path,

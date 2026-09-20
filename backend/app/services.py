@@ -111,6 +111,7 @@ def reconcile(db):
         task.error_message = "Worker lease expired; task interrupted. Retry resumes this stage."
         task.finished_at = now()
         task.run_token = None
+        task.can_pause, task.pause_requested, task.paused_at = False, False, None
         event(db, task.job_id, "task_failed", task_id=task.id, error=task.error_message)
     db.commit()
 

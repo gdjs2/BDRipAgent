@@ -35,3 +35,14 @@ def atomic_text(path: Path, text: str):
 
 def write_json(path: Path, value):
     atomic_text(path, json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False))
+
+
+def artifact_root(settings, job_id, storage):
+    roots = {
+        "workspace": job_dir(settings.workspace_root, job_id),
+        "completed": settings.completed_root,
+        "artifacts": settings.artifacts_root,
+    }
+    if storage not in roots:
+        raise ValueError("Unknown artifact storage")
+    return roots[storage]

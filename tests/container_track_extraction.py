@@ -1,7 +1,8 @@
 """Compare real batched track preparation with separate MKVToolNix extraction.
 
 Run in an isolated worker image; all fixtures and outputs live in /tmp.
-Only the saved track selection is a fixture; extraction and PGS cropping are real.
+Track selection and content classification are fixtures; extraction and PGS cropping are real.
+Content detection has separate real OCR fixtures in test_subtitle_ocr.py.
 """
 
 import json
@@ -48,7 +49,10 @@ class Context:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    def run(self, args):
+    def progress(self, value, **detail):
+        pass
+
+    def run(self, args, **kwargs):
         self.commands.append([str(x) for x in args])
         return run(args)
 
@@ -98,9 +102,12 @@ def main():
             yield SimpleNamespace(scalar=lambda query: selection)
 
         ctx = Context(root, source, tracks)
-        with patch.object(stages, "session", selected_tracks):
+        with (
+            patch.object(stages, "session", selected_tracks),
+            patch.object(stages, "classify_subtitle", lambda ctx, track, path: track),
+        ):
             save = stages.prepare_tracks(ctx)
-        save(None, ctx.job)
+        save(SimpleNamespace(scalars=lambda query: []), ctx.job)
         extraction = [cmd for cmd in ctx.commands if cmd[0] == ctx.settings.mkvextract_bin]
         assert len(extraction) == 1 and "timestamps_v2" in extraction[0]
         prepared = ctx.job.analysis["prepared_tracks"]

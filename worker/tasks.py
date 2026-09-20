@@ -112,6 +112,7 @@ def execute(task_id):
                 result(db, job)
             task.status, task.progress, task.exit_code = "SUCCEEDED", 100, 0
             task.finished_at = now()
+            task.can_pause, task.pause_requested, task.paused_at = False, False, None
             event(db, job.id, "task_completed", task_id=task_id)
             db.flush()  # Release unique active-task slot before creating the next task.
             advance(db, job)
@@ -127,6 +128,7 @@ def execute(task_id):
                 task.error_message = str(error)
                 task.exit_code = getattr(error, "exit_code", None)
                 task.finished_at = now()
+                task.can_pause, task.pause_requested, task.paused_at = False, False, None
                 event(db, task.job_id, "task_failed", task_id=task.id, error=str(error))
                 db.commit()
     finally:

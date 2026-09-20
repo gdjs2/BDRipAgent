@@ -132,11 +132,22 @@ def analyze(ctx):
         streams = [
             s for s in ff["streams"] if str(s.get("id")) in [str(p.get("number")), hex(p.get("number", -1))]
         ]
+        if len(streams) != 1:
+            # Both demuxers preserve Matroska track order within each media type.
+            # FFmpeg often omits track numbers; never confuse MKVToolNix IDs with indexes.
+            peers = [item for item in mkv["tracks"] if item["type"] == t["type"]]
+            ff_peers = [
+                item
+                for item in ff["streams"]
+                if item["codec_type"] == ("subtitle" if t["type"] == "subtitles" else t["type"])
+            ]
+            streams = [ff_peers[peers.index(t)]] if len(peers) == len(ff_peers) else []
         s = streams[0] if len(streams) == 1 else {}
         codec_id = p.get("codec_id", "")
         tracks.append(
             {
                 "track_id": t["id"],
+                "ffprobe_index": s.get("index"),
                 "kind": t["type"],
                 "codec": t["codec"],
                 "codec_id": codec_id,
@@ -144,7 +155,9 @@ def analyze(ctx):
                 "name": p.get("track_name", ""),
                 "default": p.get("default_track", False),
                 "forced": p.get("forced_track", False),
-                "hearing_impaired": bool(
+                "hearing_impaired": None
+                if t["type"] == "subtitles"
+                else bool(
                     p.get("flag_hearing_impaired", False)
                     or re.search(r"\b(SDH|CC|hearing impaired)\b", p.get("track_name", ""), re.I)
                 ),

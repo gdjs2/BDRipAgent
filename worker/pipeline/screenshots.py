@@ -598,6 +598,8 @@ def render_pairs(ctx, selected, *, review=False):
         enc_image = src_image.copy() if smoke else rgb_image(encoded_frame, ctx.job.analysis["video"])
         if src_image.size != enc_image.size:
             raise ValueError("Source/encode screenshot dimensions differ")
+        filename = Path(ctx.job.analysis.get("final_path") or ctx.job.release_name + ".mkv").name
+        encoded_label = f"SMOKE TEST - Source reused | {filename}" if smoke else filename
         output = {}
         for suffix, frame, image, label in [
             ("src", source_frame, src_image, "Source"),
@@ -605,7 +607,7 @@ def render_pairs(ctx, selected, *, review=False):
                 "encode",
                 encoded_frame,
                 enc_image,
-                "SMOKE TEST - Source reused" if smoke else ctx.job.release_name,
+                encoded_label,
             ),
         ]:
             picture = PICTURE_TYPES.get(int(frame.pict_type), "unknown")
@@ -628,6 +630,7 @@ def render_pairs(ctx, selected, *, review=False):
                     "candidate_id": shot.candidate_id,
                     "smoke_test": smoke,
                     "picture_type": picture,
+                    "overlay_label": label,
                     "pts_seconds": float(frame.pts * frame.time_base),
                 },
             )

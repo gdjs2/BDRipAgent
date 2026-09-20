@@ -4,7 +4,7 @@ A self-hosted encoding dashboard for already-ripped MKVs. Deterministic workers
 inspect, extract, encode, validate and remux media. A separate Codex service selects
 source-only comparison frames. You choose the preserved tracks and final encoding target.
 After choosing screenshots, fill in the release details to generate posting files,
-upload the selected comparison pairs, and create a verified private torrent.
+optionally upload the selected comparison pairs, and create a verified private torrent.
 
 The workflow implements [docs/impl.md](docs/impl.md) and the refinements in
 [docs/impl-add.md](docs/impl-add.md). The worker includes pinned builds of
@@ -64,10 +64,14 @@ The application cannot determine that a directly copied `.mkv` is complete.
    empty to enter title/year manually. By default the form creates separate x264
    and x265 jobs, each with its own track and encoding decisions; a single codec is also
    supported. The filename's audio tag is finalized after track selection.
-2. The worker runs mkvmerge, MediaInfo, ffprobe and HandBrake scan. The UI displays
-   tracks, normalized metadata and the authoritative crop.
-3. Confirm audio and PGS tracks. The worker extracts native audio plus its timestamps
-   and processes PGS through Sup2sup. Empty selections are permitted.
+2. The worker scans the source, extracts all PGS subtitles for content analysis,
+   and samples audio locally. Chinese variants use OCR rules first, then the agent
+   reviews SDH, audio descriptions and suggested flags before track selection opens.
+   Prompts and responses stream in the Tracks tab.
+3. Review descriptions, edit track names and flags, and confirm audio/PGS tracks.
+   Unknown flags require a Yes/No choice for selected tracks. The worker reuses
+   analyzed PGS files, extracts selected native audio plus timestamps, and crops PGS
+   through Sup2sup. Empty selections are permitted.
 4. CRF Studio samples the selected profile/crop. Open **CRF analysis** to watch
    overall progress, completed encodes, the current CRF/sample, submitted frames,
    encoder flushing, and elapsed time. The chart plots video bitrate
@@ -80,7 +84,10 @@ The application cannot determine that a directly copied `.mkv` is complete.
    range are labelled as extrapolations.
 5. HandBrake runs independently of your browser, with persistent logs and SSE
    progress. Two-pass encoding shows the current pass and overall completion and
-   occupies one queue slot for both passes. Validation fully decodes both videos, checks all frame timestamps,
+   occupies one queue slot for both passes. The **Encoding** tab shows the full saved
+   configuration, encoder options, crop/output dimensions and actual HandBrake command.
+   **Pause encoding** suspends the running encoder; **Resume encoding** continues it
+   without restarting. Validation fully decodes both videos, checks all frame timestamps,
    frame counts, duration, dimensions, color metadata, bit depth and codec.
 6. A deterministic mkvmerge plan combines video, ordered selected tracks, chapters
    and global source tags. Audio timestamps are restored. The final output appears
@@ -113,12 +120,14 @@ The application cannot determine that a directly copied `.mkv` is complete.
     description used in NFO and BBCode. Paste a dotted name and click **Convert dotted
     name** to apply BDRip_Scripts’ source format; review or edit it before saving.
     **Save details** stores a draft.
-    **Generate files & upload screenshots** uploads only the selected source/encode
-    pairs to TTG and generates `.bbcode.txt`, `.nfo`, `.md5`, and `.torrent` files.
+    **Generate files** creates `.bbcode.txt`, `.nfo`, `.md5`, and `.torrent` files.
+    Enable **Upload screenshots to TTG** to upload the selected comparison pairs;
+    otherwise the BBCode comparison section remains empty, even if an earlier run
+    uploaded images. Uploads default to off for new release forms.
     Download them from the Release tab. The job becomes complete after generation
     and torrent piece verification succeed.
 
-Screenshot uploads use BDRip_Scripts' TTG image host. Add its API token to `.env`:
+Optional screenshot uploads use BDRip_Scripts' TTG image host. To enable them, add its API token to `.env`:
 
 ```dotenv
 TU_TTG_TOKEN=your-ttg-image-host-api-token
@@ -130,12 +139,43 @@ Apply the setting to the API and worker (keep the GPU overlay if you use it):
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d api worker
 ```
 
-The release stage waits until the token and manual fields are supplied. Successful
-upload URLs persist, so retrying resumes missing images. The private torrent contains
-the MKV, NFO, and MD5 inside
-`completed/<job-id>/releases/<task-id>/<release-name>/`; the MKV is hard-linked from
-the completed remux when supported. BBCode and torrent files are separate downloadable
-artifacts. Torrent creation does not upload the torrent to the tracker or start seeding.
+A TTG token is required only when uploads are selected. Successful upload URLs
+persist, so retrying an upload-enabled generation resumes missing images. Final
+files are grouped under `STORAGE_ROOT/artifacts/`:
+
+```text
+artifacts/
+  20260920-155200 [ART] Movie.2026.1080p.BluRay.x264-WiKi/
+    Movie.2026.1080p.BluRay.x264-WiKi/
+      Movie.2026.1080p.BluRay.x264-WiKi.mkv
+      Movie.2026.1080p.BluRay.x264-WiKi.nfo
+      Movie.2026.1080p.BluRay.x264-WiKi.md5
+    Movie.2026.1080p.BluRay.x264-WiKi.bbcode.txt
+    Movie.2026.1080p.BluRay.x264-WiKi.encoder.txt
+    Movie.2026.1080p.BluRay.x264-WiKi.torrent
+```
+
+The outer timestamp is UTC at first export and remains stable on retries and
+regeneration. Separate jobs receive separate folders. The inner directory and
+torrent basename retain the BDRip_Scripts WiKi name; the torrent contains only the
+MKV, NFO, and MD5. Exports use hard links where possible. Existing user folders are
+never overwritten. The Release tab previews BBCode, NFO, MD5, and encoder notes
+inline and offers the torrent download. Torrent generation does not submit to the
+tracker or start seeding.
+
+The launcher automatically relocates legacy releases after upgrading the services,
+then removes the old torrent directory if it is empty. For a manual upgrade, run
+the relocation utility using the updated worker code with the old directory mounted:
+`python -m worker.pipeline.release_migration --legacy-torrents /torrents`.
+It preserves artifact IDs and payload bytes, updates stored paths, and only removes
+old files after the database commits. It also handles retained exports of deleted
+jobs, refuses to relocate jobs with active work, and leaves unrelated files alone.
+There is no separate torrent directory or mount for new releases.
+
+The **Screenshot agent** panel shows each request's full prompt, attachment names,
+and response text as it arrives. Choose an earlier selection attempt to inspect its
+recorded transcript. Reloading or reconnecting replays saved events; older attempts
+created before transcript recording show an explanatory empty state.
 
 The **Task log** panel appears at the bottom of every job tab. It follows the
 latest task automatically and refreshes running output every three seconds.
@@ -209,8 +249,18 @@ CRF analysis, encoding and validation. Each job runs only one stage at a time.
 Track and CRF decision screens use no slot. Jobs enter the queue after a decision
 or when an automatic stage finishes; ready stages start in queue order, normally
 within ten seconds. Held jobs retain their position and are skipped until resumed.
-Pausing or lowering the limit lets current work finish its stage. Queue settings,
-order and holds survive restarts. Failed tasks wait for an explicit retry.
+Pausing the queue or lowering its limit lets current work finish its stage. Queue
+settings, order and holds survive restarts. Failed tasks wait for an explicit retry.
+
+For a running final encode, use **Pause encoding** on its progress card or Queue
+row. **Resume encoding** continues the same encoder process, including a two-pass
+encode. Paused encodes retain progress, memory and their queue slot; cancellation
+still works. The worker keeps renewing its lease and excludes paused time from
+its timeout and active elapsed counter. Keep the worker/container running: pause
+is not a checkpoint that survives a service restart. A lost worker requires retry
+from the beginning of encoding. Pause controls appear once a supported worker
+starts HandBrake; CRF sampling and other stages continue to use queue controls.
+Database migration `0004` adds the requested/acknowledged pause state.
 
 Use **Remove** beside a job on the dashboard to hide it from the list and cancel
 its queued work. The confirmation identifies the movie/profile. Files are retained;
@@ -230,8 +280,9 @@ Running tasks renew a lease every five seconds. Expired leases are fenced and
 marked failed at the existing stage. Retry creates a new attempt and preserves
 the previous attempt/log. Each attempt has its own output directory. A lost DB
 connection stops worker activity; process groups are terminated on cancellation
-or timeout. An in-progress Codex HTTP request may continue until it returns or
-times out; its result is discarded if the worker has lost its lease.
+or timeout. Streaming agent requests check cancellation on heartbeat messages;
+closing the request cancels the agent subprocess. Results are accepted only while
+the worker still owns its task lease.
 
 Restarting the API does not interrupt a worker with a live lease. Restarting a
 worker during a command interrupts that stage; after lease expiry, retry it from
@@ -267,7 +318,7 @@ snapshot from CRF analysis. To compare another profile, create another job.
 API routes follow the spec under `/api`; OpenAPI is available inside the API
 container at `/docs`. The frontend exposes eight views: dashboard, new job,
 overview, tracks, CRF analysis, encode status, screenshots and artifacts/logs.
-Release publication, torrent/NFO generation and trackers remain outside V1.
+The Release tab generates and previews publication files. Tracker submission and seeding remain outside V1.
 
 ## Development and verification
 
@@ -298,3 +349,25 @@ outline and character spacing are calibrated; the open Liberation Sans font is
 visually close but does not reproduce every reference glyph pixel.
 The container tests exercise real CRF Studio, Sup2Sup, HandBrake and MKVToolNix.
 Each harness documents its fixture boundaries. See [test notes](docs/testing.md).
+
+Subtitle content is analyzed **before track selection**, including tracks you may
+later discard. The Tracks tab shows Chinese script/Cantonese findings, SDH,
+coverage, agent descriptions, and suggested flags. Edit the final MKV name and
+Default, Forced, SDH/hearing-impaired, Audio description, and Commentary flags
+before confirming. Original evidence and agent suggestions remain available;
+explicit user choices take precedence during preparation and final muxing.
+
+Audio review decodes three 30-second samples across each track locally and uses
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) for local speech
+recognition (CPU int8, `small` model by default). The first analysis downloads
+model weights into `cache/speech-models`; subsequent jobs reuse them. The agent
+receives metadata, signal measurements and transcripts, not raw audio. Descriptions
+state sampling limits; failed/unavailable transcription is marked clearly. Set
+`integrations.audio_review` in `config/application.yaml` to adjust the model,
+sample count/duration, CPU threads, or disable transcription.
+
+Inconclusive subtitles stay visible for review. Uncertain SDH can be overridden
+explicitly; unresolved language/script still requires a successful content check
+before muxing. Existing jobs waiting for track selection have an **Analyze tracks**
+action. Rebuild the worker, agent, API and frontend to activate this workflow.
+See [track detection](docs/integrations.md#naming) for configuration and limits.

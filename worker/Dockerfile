@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:0.9.6 AS uv
 FROM python:3.13-slim-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends handbrake-cli mkvtoolnix ffmpeg mediainfo fonts-liberation fonts-liberation2 fonts-dejavu-core ca-certificates git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends handbrake-cli mkvtoolnix ffmpeg mediainfo fonts-liberation fonts-liberation2 fonts-dejavu-core tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra tesseract-ocr-jpn tesseract-ocr-kor opencc libgomp1 ca-certificates git && rm -rf /var/lib/apt/lists/*
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 PATH="/app/.venv/bin:$PATH"
@@ -21,5 +21,7 @@ RUN git init /opt/crf-studio && git -C /opt/crf-studio remote add origin https:/
 RUN git init /opt/sup2sup && git -C /opt/sup2sup remote add origin https://github.com/gdjs2/Sup2Sup.git && \
     git -C /opt/sup2sup fetch --depth 1 origin "$SUP2SUP_REV" && git -C /opt/sup2sup checkout FETCH_HEAD && \
     uv sync --frozen --no-dev --project /opt/sup2sup --python /usr/local/bin/python
+# Local CPU speech recognition stays separate from the media-tool Python environments.
+RUN uv venv /opt/audio-review && uv pip install --python /opt/audio-review/bin/python faster-whisper==1.2.1
 # Module startup keeps /app on sys.path for imports made later by worker tasks.
 CMD ["python", "-m", "celery", "-A", "worker.tasks:celery", "worker", "--loglevel=INFO", "--autoscale=8,1"]

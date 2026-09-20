@@ -3,6 +3,10 @@ export type Profile = {
   encoder: string;
   preset: string;
   bit_depth: number;
+  tune?: string | null;
+  video_profile?: string | null;
+  level?: string | number | null;
+  extra_options?: string | null;
   crf_min?: number;
   crf_max?: number;
 };
@@ -22,6 +26,8 @@ export type Config = {
   stages: string[];
   release?: { upload_host: string; upload_configured: boolean };
 };
+export type TrackFlag =
+  "default" | "forced" | "hearing_impaired" | "visual_impaired" | "commentary";
 export type Track = {
   track_id: number;
   kind: string;
@@ -31,15 +37,54 @@ export type Track = {
     language: string;
     name: string;
     mux_name?: string;
-    hearing_impaired?: boolean;
+    name_override?: string;
+    suggested_name?: string;
+    base_name?: string;
+    source_subtitle_metadata?: { language: string; name: string };
+    hearing_impaired?: boolean | null;
+    subtitle_detection?: {
+      schema_version: number;
+      status?: "resolved" | "inconclusive";
+      language_confident?: boolean;
+      sdh_confident?: boolean;
+      hearing_impaired?: boolean | null;
+      method: string;
+      sampled_cues: number;
+      unique_cues: number;
+      explanation: string;
+    };
     channels?: number;
     channel_layout?: string;
     sample_rate?: number;
     bit_depth?: number;
     bitrate?: string;
-    default: boolean;
-    forced: boolean;
-    commentary: boolean;
+    default: boolean | null;
+    forced: boolean | null;
+    commentary: boolean | null;
+    visual_impaired?: boolean | null;
+    flag_overrides?: Partial<Record<TrackFlag, boolean>>;
+    track_review?: {
+      schema_version: number;
+      description: string;
+      flag_explanation: string;
+      confidence: string;
+      flags: Record<TrackFlag, boolean | null>;
+    };
+    audio_analysis?: {
+      method: string;
+      sampled_seconds?: number;
+      source_duration_seconds?: number;
+      transcription_available?: boolean;
+      limitations: string[];
+      samples: {
+        id: number;
+        start_seconds: number;
+        duration_seconds: number;
+        detected_language?: string;
+        language_probability?: number;
+        segments?: { start: number; end: number; text: string }[];
+      }[];
+    };
     extractable: boolean;
   };
 };
@@ -50,12 +95,16 @@ export type Task = {
   status: string;
   progress: number;
   progress_detail: Record<string, number | string | boolean | null>;
+  command_json?: string[][];
   error_message?: string;
   created_at: string;
   started_at?: string | null;
   finished_at?: string | null;
   held?: boolean;
   cancel_requested?: boolean;
+  can_pause?: boolean;
+  pause_requested?: boolean;
+  paused_at?: string | null;
   attempt: number;
 };
 export type Artifact = {
@@ -94,6 +143,7 @@ export type Job = {
   artifacts: Artifact[];
   screenshot_policy: Policy;
   analysis: {
+    track_review_version?: number;
     release_details?: ReleaseDetails;
     release_result?: ReleaseResult;
     smoke_test?: boolean;
@@ -133,10 +183,13 @@ export type Job = {
       crf?: number | null;
       bitrate_kbps?: number | null;
       profile_snapshot: Profile;
+      selected_by?: string;
+      selected_at?: string;
     };
   };
 };
 export type ReleaseDetails = {
+  upload_screenshots: boolean;
   source: string;
   chinese_name: string;
   extra_description: string;
@@ -148,10 +201,21 @@ export type ReleaseResult = {
   md5: string;
   uploaded_images: number;
   package_path: string;
+  package_storage?: string;
+  torrent_path?: string;
+  torrent_storage?: string;
+  bundle_path?: string;
+  upload_screenshots?: boolean;
   warnings: string[];
   artifacts: { path: string; kind: string; storage: string }[];
 };
 export type Shot = {
+  reservation?: {
+    job_id: string;
+    codec: string;
+    frame_number: number;
+    spacing_seconds: number;
+  } | null;
   id: string;
   candidate_id: number;
   selected: boolean;

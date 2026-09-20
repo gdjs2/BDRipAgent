@@ -95,7 +95,24 @@ def audio_channels(track):
 
 
 def track_name(track):
-    parts = [language_name(track.get("language"))]
+    return track.get("name_override") or automatic_track_name(track)
+
+
+def automatic_track_name(track):
+    code = (track.get("language") or "und").lower().split("-")
+    label = language_name(track.get("language"))
+    if track["kind"] == "subtitles":
+        if code[0] == "yue":
+            label = "Cantonese"
+            if "hans" in code or "hant" in code:
+                label += " (Simplified)" if "hans" in code else " (Traditional)"
+        elif code[0] in ("zh", "zho", "chi", "cmn"):
+            label = (
+                "Simplified Chinese"
+                if "hans" in code
+                else ("Traditional Chinese" if "hant" in code else "Chinese")
+            )
+    parts = [label]
     if track["kind"] == "audio":
         parts += [audio_format(track), audio_channels(track)]
     else:
@@ -106,7 +123,7 @@ def track_name(track):
                 "S_TEXT/ASS": "ASS",
                 "S_TEXT/SSA": "SSA",
                 "S_VOBSUB": "VobSub",
-            }.get(track.get("codec_id"), track["codec"])
+            }.get(track.get("codec_id"), track.get("codec", "Unknown"))
         )
         if track.get("hearing_impaired"):
             parts.append("SDH")

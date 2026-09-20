@@ -38,6 +38,8 @@ def extraction_job(client, new_job, monkeypatch):
             raise ToolError(command, 2)
         mode = None
         for arg in command[2:]:
+            if arg == "--gui-mode":
+                continue
             if arg in ("tracks", "timestamps_v2"):
                 mode = arg
                 continue
@@ -54,6 +56,17 @@ def extraction_job(client, new_job, monkeypatch):
         cropped.append(original.name)
         output.write_bytes(original.read_bytes())
 
+    def classify(ctx, track, path):
+        assert path.read_text() == "track data"
+        return {
+            **track,
+            "language": "zh-Hant",
+            "hearing_impaired": False,
+            "mux_name": "Traditional Chinese PGS",
+            "subtitle_detection": {"schema_version": 1, "method": "program + agent"},
+        }
+
+    monkeypatch.setattr("worker.pipeline.stages.classify_subtitle", classify)
     monkeypatch.setattr(TaskContext, "run", run)
     monkeypatch.setattr(Sup2supAdapter, "crop", crop)
     return new_job["id"], calls, cropped, fault
@@ -76,17 +89,24 @@ def test_selected_tracks_and_audio_timestamps_share_one_extraction(client, extra
     job_id, calls, cropped, _ = extraction_job
     job = prepare(client, job_id, audio, subtitles)
     assert job["state"] == "RUNNING_CRF_ANALYSIS"
+    assert next(t for t in job["tasks"] if t["type"] == "prepare_tracks")["progress"] == 100
     prepared = job["analysis"]["prepared_tracks"]
     assert [t["track_id"] for t in prepared] == audio + subtitles
     assert len(calls) == int(bool(audio or subtitles))
     if calls:
-        command = calls[0]
+        assert "--gui-mode" in calls[0]
+        command = [arg for arg in calls[0] if arg != "--gui-mode"]
         split = command.index("timestamps_v2") if audio else len(command)
         assert command[2] == "tracks"
         assert [int(arg.split(":", 1)[0]) for arg in command[3:split]] == audio + subtitles
         assert [int(arg.split(":", 1)[0]) for arg in command[split + 1 :]] == audio
     assert cropped == [f"track-{i}.sup" for i in subtitles]
     for track in prepared:
+        if track["kind"] == "subtitles":
+            row = next(t for t in job["tracks"] if t["track_id"] == track["track_id"])
+            assert row["info"]["language"] == "zh-Hant"
+            assert row["info"]["hearing_impaired"] is False
+            assert row["info"]["mux_name"] == "Traditional Chinese PGS"
         assert ("timestamps" in track) == (track["kind"] == "audio")
         assert track["path"].endswith(".ac3" if track["kind"] == "audio" else ".cropped.sup")
     kinds = [a["artifact_type"] for a in job["artifacts"]]

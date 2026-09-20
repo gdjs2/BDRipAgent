@@ -16,6 +16,11 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
+import type { TrackFlag } from "./types";
+import { EncodingConfiguration } from "./EncodingConfiguration";
+import { EncodingPauseButton } from "./EncodingPauseButton";
+import { encodingPauseState } from "./encoding-pause";
+import { AgentTranscript } from "./AgentTranscript";
 import { BitrateCurve } from "./BitrateCurve";
 import { CRFProgress } from "./CRFProgress";
 import { QueuePage, QueueSummary } from "./Queue";
@@ -580,6 +585,11 @@ function JobPage({ config }: { config: Config }) {
       "ready",
       "state_changed",
       "task_started",
+      "task_pause_requested",
+      "task_pause_available",
+      "task_pause_unavailable",
+      "task_paused",
+      "task_resumed",
       "task_progress",
       "task_failed",
       "task_completed",
@@ -650,7 +660,7 @@ function JobPage({ config }: { config: Config }) {
       </nav>
       <Routes>
         <Route index element={<Overview job={j} stages={config.stages} />} />
-        <Route path="tracks" element={<Tracks job={j} />} />
+        <Route path="tracks" element={<Tracks key={j.id} job={j} />} />
         <Route path="crf" element={<CRF job={j} />} />
         <Route path="encode" element={<EncodeStatus job={j} />} />
         <Route path="screenshots" element={<Gallery job={j} />} />
@@ -730,7 +740,7 @@ function Overview({ job, stages }: { job: Job; stages: string[] }) {
           {job.state === "WAITING_FOR_RELEASE_DETAILS" && (
             <Callout to="release" title="Add your release details">
               Enter the Chinese name, source, extra description, and tracker to
-              generate release files and upload your screenshots.
+              generate release files, with optional screenshot uploads.
             </Callout>
           )}
           <section>
@@ -803,34 +813,112 @@ function Callout({
 function Tracks({ job }: { job: Job }) {
   const query = useQueryClient();
   const [audio, setAudio] = useState<number[]>(
-      job.track_selection?.audio_track_ids ?? [],
-    ),
-    [subs, setSubs] = useState<number[]>(
-      job.track_selection?.subtitle_track_ids ?? [],
-    );
-  const enabled = job.state === "WAITING_FOR_TRACK_SELECTION";
+    job.track_selection?.audio_track_ids ?? [],
+  );
+  const [subs, setSubs] = useState<number[]>(
+    job.track_selection?.subtitle_track_ids ?? [],
+  );
+  const [names, setNames] = useState<Record<number, string>>({});
+  const [flags, setFlags] = useState<
+    Record<number, Partial<Record<TrackFlag, boolean>>>
+  >({});
+  const flagLabels: [TrackFlag, string][] = [
+    ["default", "Default"],
+    ["forced", "Forced"],
+    ["hearing_impaired", "SDH / hearing impaired"],
+    ["visual_impaired", "Audio description"],
+    ["commentary", "Commentary"],
+  ];
+  const waiting = job.state === "WAITING_FOR_TRACK_SELECTION";
+  const subtitles = job.tracks.filter(
+    (t) => t.kind === "subtitles" && t.info.extractable,
+  );
+  const needsAnalysis =
+    job.tracks.length > 0 &&
+    (job.analysis.track_review_version !== 1 ||
+      subtitles.some((t) => t.info.subtitle_detection?.schema_version !== 1));
+  const inconclusive = subtitles.some(
+    (t) => t.info.subtitle_detection?.status === "inconclusive",
+  );
+  const analyze = useMutation({
+    mutationFn: () => api(`/jobs/${job.id}/tracks/analyze`, {}),
+    onSuccess: () => query.invalidateQueries({ queryKey: ["job", job.id] }),
+  });
+  const enabled = waiting && !needsAnalysis && !analyze.isPending;
   const save = useMutation({
     mutationFn: () =>
       api(`/jobs/${job.id}/tracks/selection`, {
         audio_track_ids: audio,
         subtitle_track_ids: subs,
+        track_flags: Object.fromEntries(
+          Object.entries(flags).filter(([id]) =>
+            [...audio, ...subs].includes(Number(id)),
+          ),
+        ),
+        track_names: Object.fromEntries(
+          Object.entries(names).filter(([id]) =>
+            [...audio, ...subs].includes(Number(id)),
+          ),
+        ),
       }),
     onSuccess: () => query.invalidateQueries({ queryKey: ["job", job.id] }),
   });
+  const invalidNames = [...audio, ...subs].some(
+    (id) => names[id] !== undefined && !names[id].trim(),
+  );
+  const unresolvedFlags = job.tracks.some(
+    (t) =>
+      [...audio, ...subs].includes(t.track_id) &&
+      flagLabels.some(
+        ([key]) => (flags[t.track_id]?.[key] ?? t.info[key]) == null,
+      ),
+  );
   const toggle = (list: number[], n: number) =>
     list.includes(n) ? list.filter((x) => x !== n) : [...list, n];
+  const activeAnalysis = job.tasks.find(
+    (t) => t.type === "analyze" && ["QUEUED", "RUNNING"].includes(t.status),
+  );
   return (
     <>
       <div className="section-heading">
         <div>
-          <h2>Preserve the tracks you want</h2>
+          <h2>Review descriptions and choose tracks</h2>
           <p>
-            Audio stays in its original codec. Selected PGS subtitles use the
-            saved crop.
+            PGS subtitles are checked before selection for Chinese script,
+            Cantonese, and SDH content. Audio keeps its original codec and
+            selected subtitles use the saved crop. The agent describes locally
+            sampled audio and suggests flags. Review or change the final MKV
+            names and flags below.
           </p>
         </div>
         <Badge>HUMAN GATE 1</Badge>
       </div>
+      {job.state === "ANALYZING_SOURCE" && (
+        <p className="callout" role="status">
+          {activeAnalysis
+            ? activeAnalysis.progress_detail.phase ||
+              "Analyzing the source and subtitle content…"
+            : "Source analysis has stopped. Check the task on Overview and retry to continue."}{" "}
+          Track selection opens when analysis finishes. Agent reviews appear
+          below.
+        </p>
+      )}
+      {waiting && (needsAnalysis || inconclusive) && (
+        <div className="callout">
+          <p>
+            {needsAnalysis
+              ? "This job needs the initial track review. Run analysis for audio descriptions, subtitle findings, and suggested flags before selection."
+              : "Some findings are inconclusive. You can skip those tracks or retry analysis. You can override uncertain SDH explicitly below; uncertain language still needs another content check before muxing."}
+          </p>
+          <button
+            disabled={analyze.isPending || save.isPending}
+            onClick={() => analyze.mutate()}
+          >
+            {analyze.isPending ? "Queuing analysis…" : "Analyze tracks"}
+          </button>
+        </div>
+      )}
+      <ErrorBox error={analyze.error} />
       {["audio", "subtitles"].map((kind) => (
         <section key={kind}>
           <h2>{kind === "audio" ? "Audio tracks" : "PGS subtitles"}</h2>
@@ -839,14 +927,34 @@ function Tracks({ job }: { job: Job }) {
             .map((t) => {
               const allowed = t.info.extractable;
               const list = kind === "audio" ? audio : subs;
+              const detection = t.info.subtitle_detection;
+              const editable = enabled && allowed && !save.isPending;
+              const effectiveFlags = {
+                ...t.info,
+                ...(waiting ? flags[t.track_id] : {}),
+              };
+              const suggested =
+                kind === "subtitles" && t.info.base_name
+                  ? [
+                      t.info.base_name,
+                      effectiveFlags.hearing_impaired && "SDH",
+                      effectiveFlags.forced && "Forced",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")
+                  : (t.info.suggested_name ?? t.info.mux_name ?? t.info.name);
+              const name = waiting
+                ? (names[t.track_id] ?? t.info.name_override ?? suggested)
+                : (t.info.mux_name ?? t.info.name);
               return (
-                <label
+                <article
                   className={`track ${!allowed ? "disabled" : ""}`}
                   key={t.track_id}
                 >
                   <input
+                    id={`include-track-${t.track_id}`}
                     type="checkbox"
-                    disabled={!enabled || !allowed}
+                    disabled={!editable}
                     checked={list.includes(t.track_id)}
                     onChange={() =>
                       kind === "audio"
@@ -856,11 +964,13 @@ function Tracks({ job }: { job: Job }) {
                   />
                   <div className="grow">
                     <h3>
-                      Track {t.track_id} · {t.info.language} · {t.info.codec}
+                      <label htmlFor={`include-track-${t.track_id}`}>
+                        Track {t.track_id} · {t.info.language} · {t.info.codec}
+                      </label>
                     </h3>
                     <p>
                       {[
-                        t.info.mux_name ?? t.info.name,
+                        suggested,
                         t.info.channel_layout ??
                           (t.info.channels && `${t.info.channels} channels`),
                         t.info.bit_depth && `${t.info.bit_depth}-bit`,
@@ -870,31 +980,200 @@ function Tracks({ job }: { job: Job }) {
                         .filter(Boolean)
                         .join(" · ") || "No additional track metadata"}
                     </p>
-                    {!allowed && (
+                    {t.info.track_review && (
+                      <div className="subtitle-description">
+                        <p>{t.info.track_review.description}</p>
+                        <small>
+                          Agent confidence: {t.info.track_review.confidence}
+                        </small>
+                      </div>
+                    )}
+                    {t.info.audio_analysis && (
+                      <details className="subtitle-description">
+                        <summary>
+                          Local audio evidence ·{" "}
+                          {t.info.audio_analysis.sampled_seconds ?? 0}s sampled
+                        </summary>
+                        <p>{t.info.audio_analysis.method}</p>
+                        {t.info.audio_analysis.limitations.map((text) => (
+                          <p key={text}>{text}</p>
+                        ))}
+                        {t.info.audio_analysis.samples.map((sample) => (
+                          <div key={sample.id}>
+                            <small>
+                              Sample {sample.id} ·{" "}
+                              {sample.start_seconds.toFixed(1)}s ·{" "}
+                              {sample.duration_seconds.toFixed(1)}s duration
+                              {sample.detected_language &&
+                                ` · detected ${sample.detected_language} (${Math.round((sample.language_probability ?? 0) * 100)}%)`}
+                            </small>
+                            <p>
+                              {sample.segments
+                                ?.map((segment) => segment.text)
+                                .join(" ") ||
+                                "No speech transcript available for this sample."}
+                            </p>
+                          </div>
+                        ))}
+                      </details>
+                    )}
+                    {kind === "subtitles" && allowed && (
+                      <div className="subtitle-description">
+                        {detection ? (
+                          <>
+                            <p>
+                              <strong>
+                                {detection.status === "inconclusive"
+                                  ? "Inconclusive content check"
+                                  : "Content checked"}
+                              </strong>
+                              {" · "}SDH:{" "}
+                              {detection.hearing_impaired == null
+                                ? "unknown"
+                                : detection.hearing_impaired
+                                  ? "yes"
+                                  : "no"}
+                              {detection.language_confident === false &&
+                                " · Language/script uncertain"}
+                            </p>
+                            <p>{detection.explanation}</p>
+                            <small>
+                              {detection.method} · {detection.sampled_cues}/
+                              {detection.unique_cues} distinct cues inspected
+                            </small>
+                          </>
+                        ) : (
+                          <p>
+                            Language and SDH content check pending; source
+                            labels are unverified.
+                          </p>
+                        )}
+                        {t.info.source_subtitle_metadata?.name && (
+                          <small>
+                            Original source label:{" "}
+                            {t.info.source_subtitle_metadata.name}
+                          </small>
+                        )}
+                      </div>
+                    )}
+                    {allowed ? (
+                      <div className="track-name-field">
+                        <label htmlFor={`track-name-${t.track_id}`}>
+                          Final MKV track name
+                        </label>
+                        <input
+                          id={`track-name-${t.track_id}`}
+                          type="text"
+                          maxLength={255}
+                          value={name}
+                          disabled={!editable}
+                          onChange={(event) =>
+                            setNames((current) => ({
+                              ...current,
+                              [t.track_id]: event.target.value,
+                            }))
+                          }
+                        />
+                        {editable && name !== suggested && (
+                          <button
+                            className="secondary"
+                            onClick={() =>
+                              setNames((current) => {
+                                const next = { ...current };
+                                delete next[t.track_id];
+                                return next;
+                              })
+                            }
+                          >
+                            Use suggested name
+                          </button>
+                        )}
+                        {kind === "subtitles" && (
+                          <small>
+                            The name is a label. Language and flag settings are
+                            stored separately.
+                          </small>
+                        )}
+                      </div>
+                    ) : (
                       <small>
                         Unsupported codec for native extraction in this version
                       </small>
                     )}
+                    {allowed && (
+                      <fieldset className="track-flags" disabled={!editable}>
+                        <legend>Final MKV flags</legend>
+                        <div className="track-flag-grid">
+                          {flagLabels.map(([key, label]) => {
+                            const value = waiting
+                              ? (flags[t.track_id]?.[key] ?? t.info[key])
+                              : t.info[key];
+                            return (
+                              <label key={key}>
+                                {label}
+                                <select
+                                  value={
+                                    value == null ? "unknown" : String(value)
+                                  }
+                                  onChange={(event) =>
+                                    setFlags((current) => ({
+                                      ...current,
+                                      [t.track_id]: {
+                                        ...current[t.track_id],
+                                        [key]: event.target.value === "true",
+                                      },
+                                    }))
+                                  }
+                                >
+                                  <option value="unknown" disabled>
+                                    Unknown — choose
+                                  </option>
+                                  <option value="true">Yes</option>
+                                  <option value="false">No</option>
+                                </select>
+                              </label>
+                            );
+                          })}
+                        </div>
+                        {t.info.track_review && (
+                          <small>{t.info.track_review.flag_explanation}</small>
+                        )}
+                      </fieldset>
+                    )}
                   </div>
-                  {t.info.default && <Badge>DEFAULT</Badge>}
-                  {t.info.forced && <Badge>FORCED</Badge>}
-                  {t.info.commentary && <Badge>COMMENTARY</Badge>}
-                  {t.info.hearing_impaired && <Badge>SDH</Badge>}
-                </label>
+                  {effectiveFlags.default && <Badge>DEFAULT</Badge>}
+                  {effectiveFlags.forced && <Badge>FORCED</Badge>}
+                  {effectiveFlags.commentary && <Badge>COMMENTARY</Badge>}
+                  {effectiveFlags.hearing_impaired &&
+                    (kind === "audio" || detection) && <Badge>SDH</Badge>}
+                </article>
               );
             })}
           {job.tracks.filter((t) => t.kind === kind).length === 0 && (
-            <p className="muted">No tracks available.</p>
+            <p className="muted">
+              {job.state === "ANALYZING_SOURCE"
+                ? "Waiting for analysis…"
+                : "No tracks available."}
+            </p>
           )}
         </section>
       ))}
+      {unresolvedFlags && (
+        <p className="error">
+          Choose Yes or No for unknown flags on selected tracks.
+        </p>
+      )}
+      {invalidNames && (
+        <p className="error">Selected tracks need a nonempty name.</p>
+      )}
       <button
-        disabled={!enabled || save.isPending}
+        disabled={!enabled || save.isPending || invalidNames || unresolvedFlags}
         onClick={() => save.mutate()}
       >
         Confirm {audio.length} audio + {subs.length} subtitle tracks →
       </button>
       <ErrorBox error={save.error} />
+      <AgentTranscript job={job} subtitles />
     </>
   );
 }
@@ -1123,7 +1402,12 @@ function TaskCard({ task }: { task: Task }) {
 }
 
 function TaskAttempt({ task }: { task: Task }) {
+  const pause = encodingPauseState(task);
   const query = useQueryClient();
+  const waitingForTool =
+    task.status === "RUNNING" &&
+    typeof task.progress_detail.tool === "string" &&
+    typeof task.progress_detail.tool_percentage !== "number";
   const action = useMutation({
     mutationFn: (verb: string) => api(`/tasks/${task.id}/${verb}`, {}),
     // Refresh even after a stale retry request, and reset mutation errors when
@@ -1138,21 +1422,40 @@ function TaskAttempt({ task }: { task: Task }) {
             ? "CRF analysis progress"
             : readable(task.type)}
         </h2>
-        <Badge>{task.status}</Badge>
+        <Badge>{pause?.status ?? task.status}</Badge>
       </div>
+      {pause && (task.pause_requested || task.paused_at) && (
+        <p role="status" className="callout">
+          {pause.status}. Your progress is retained. The encode keeps its queue
+          slot and can be resumed or cancelled.
+        </p>
+      )}
       {task.type === "crf_analysis" ? (
         <CRFProgress task={task} />
       ) : (
         <>
+          {typeof task.progress_detail.phase === "string" && (
+            <p role="status">{task.progress_detail.phase}</p>
+          )}
           <progress
             aria-label="Task progress"
-            value={task.progress}
+            value={waitingForTool ? undefined : task.progress}
             max="100"
           />
           <div className="section-heading">
-            <span>{task.progress.toFixed(1)}%</span>
+            <span>
+              {waitingForTool
+                ? "Waiting for tool progress…"
+                : `${task.progress.toFixed(1)}%`}
+            </span>
             <small>Attempt {task.attempt}</small>
           </div>
+          {typeof task.progress_detail.tool_percentage === "number" && (
+            <p className="muted">
+              {String(task.progress_detail.tool)} ·{" "}
+              {task.progress_detail.tool_percentage.toFixed(1)}%
+            </p>
+          )}
           {typeof task.progress_detail.pass_number === "number" && (
             <p className="muted">
               Pass {task.progress_detail.pass_number} of{" "}
@@ -1165,7 +1468,14 @@ function TaskAttempt({ task }: { task: Task }) {
             {Object.entries(task.progress_detail)
               .filter(
                 ([k]) =>
-                  !["pass_number", "pass_count", "pass_percentage"].includes(k),
+                  ![
+                    "pass_number",
+                    "pass_count",
+                    "pass_percentage",
+                    "phase",
+                    "tool",
+                    "tool_percentage",
+                  ].includes(k),
               )
               .map(([k, v]) => (
                 <div key={k}>
@@ -1191,6 +1501,7 @@ function TaskAttempt({ task }: { task: Task }) {
           Retry this stage
         </button>
       )}
+      <EncodingPauseButton task={task} />
       {["RUNNING", "QUEUED"].includes(task.status) && (
         <button
           className="secondary"
@@ -1206,23 +1517,14 @@ function TaskAttempt({ task }: { task: Task }) {
 }
 
 function EncodeStatus({ job }: { job: Job }) {
-  const task = latestTask(job);
+  const task = latestTask({
+    ...job,
+    tasks: job.tasks.filter((item) =>
+      ["encode", "validate", "mux"].includes(item.type),
+    ),
+  });
   return (
     <>
-      {job.encode_config && (
-        <section>
-          <h2>Selected by you</h2>
-          <p>
-            {job.encode_config.data.profile} ·{" "}
-            {job.encode_config.data.execution_mode === "smoke"
-              ? "Smoke test · source video reused"
-              : job.encode_config.data.rate_control === "bitrate"
-                ? `${(job.encode_config.data.bitrate_kbps! / 1000).toFixed(3)} Mbps · 2-pass`
-                : `CRF ${job.encode_config.data.crf}`}{" "}
-            · {job.encode_config.data.profile_snapshot.preset}
-          </p>
-        </section>
-      )}
       {task ? (
         <TaskCard task={task} />
       ) : (
@@ -1230,6 +1532,7 @@ function EncodeStatus({ job }: { job: Job }) {
           Select tracks and review the CRF analysis to continue.
         </Empty>
       )}
+      <EncodingConfiguration job={job} />
       {job.validation.valid !== undefined && (
         <section>
           <h2>
@@ -1330,6 +1633,7 @@ function Gallery({ job }: { job: Job }) {
         <>
           <ScreenshotDecoderSettings key={job.id} job={job} />
           {task && <TaskCard task={task} />}
+          <AgentTranscript key={`agent-${job.id}`} job={job} />
         </>
       }
     />

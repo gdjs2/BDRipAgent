@@ -1,5 +1,64 @@
 # Test coverage
 
+## Encoding pause and configuration
+
+`tests/test_encoding_pause.py` exercises authenticated controls, unsupported and
+terminal states, idempotent requests, real process-group suspension, same-PID
+resume, frozen progress, heartbeat renewal beyond the command timeout, retained
+queue capacity, paused cancellation, and lease fencing/retry cleanup. The migration
+test verifies old tasks keep their data with pause disabled. Frontend tests cover
+pause acknowledgements, cancellation states, exact command selection per attempt,
+literal shell-argument display, and crop/smoke dimensions. The configuration panel
+uses the persisted profile snapshot and recorded command, not current profile files.
+
+## Initial track review
+
+`tests/test_track_review.py` checks all PGS/audio descriptions before the selection
+gate, cached extraction reuse, Unicode manual names, flag overrides, strict
+validation, unknown flags requiring a user choice, legacy reanalysis and agent
+stream authentication/evidence validation. `tests/test_audio_review.py` uses real
+FFmpeg samples from two distinct streams to catch incorrect track-index mapping,
+checks transcription failure reporting and cancellation, and verifies transcript
+fields. Subtitle tests cover initial agent SDH review even with confident program
+findings, inconclusive descriptions, and explicit user overrides.
+
+`tests/container_audio_review.py` passed with real local `small` faster-whisper
+inference on generated espeak commentary and FFmpeg sampling. Model weights are
+downloaded on first use; no remote agent is called. `tests/container_track_review.py`
+checks real MKVToolNix output with custom Unicode labels and explicit true/false
+values for all five flags. Run these harnesses in an isolated worker test image;
+espeak is only needed for the speech fixture, not in production.
+
+## MKVToolNix progress
+
+`tests/test_mkvtoolnix_progress.py` covers GUI and carriage-return output, every
+split point in a progress record, duplicate and invalid records, bounded buffering,
+subprocess updates persisted to the task API and event stream, warning/failure
+exits, and the final report at process exit. It also exercises real `mkvmerge` and
+batched `mkvextract` output when those binaries are installed. Tool completion
+remains below 100% task progress until the worker accepts the stage's outputs.
+Timestamp indexing maps measured progress into the first 5% of candidate generation.
+
+The real batched-extraction container check and source-reuse smoke pipeline cover
+track preparation, remuxing, and screenshot timestamp indexing with GUI output enabled.
+
+## Agent streaming and separate release exports
+
+`tests/test_agent_stream.py` uses a fake Codex app-server that waits for the client
+to acknowledge a response delta before it can finish. It covers displayed prompts,
+image attachments, structured outputs, omission of reasoning events, timeout and
+cancellation cleanup, the internal stream, persisted task events, authenticated SSE,
+replay, and reconnect cursors. The installed Codex CLI also passed an offline
+initialize/thread-start protocol check without starting a model turn. No live model
+selection is part of these checks.
+
+`frontend/tests/agent-transcript.test.mjs` checks incremental text, final-message
+replacement, and independent correction requests. Release tests cover upload-disabled
+requests without credentials, strict booleans, new storage downloads, complete output
+sets, repeat exports, and ownership conflicts. The native `container_release.py`
+check verifies an empty BBCode comparison section with uploads disabled even when
+cached image URLs exist, and independently verifies the resulting torrent pieces.
+
 ## Release stage
 
 `tests/test_release.py` exercises the release-details gate, draft persistence,
@@ -468,3 +527,26 @@ at the bottom of all six job tabs. Checks cover retained task selection across
 navigation without remounting, automatic following of new tasks, running-log
 polling, final output after completion, empty task history, and desktop/mobile
 layout. Fixture API routes are read-only and leave production jobs unchanged.
+
+Subtitle content tests (`tests/test_subtitle_detection.py`) cover Simplified and
+Traditional Chinese, Cantonese in both scripts, ambiguous OCR, incorrect source
+SDH flags, evidence validation, the streamed agent endpoint, and legacy prepared
+jobs. `tests/test_subtitle_ocr.py` generates original PGS bitmaps and exercises real
+Sup2Sup rendering, Tesseract, OpenCC, task progress, and MKVToolNix names/IETF tags/SDH
+flags. These native tests require the worker OCR packages and `fonts-noto-cjk` for
+fixture generation. The latter is test-only; production renders existing bitmaps.
+Model responses are mocked in tests, so no live Codex account or model call is used.
+
+Release bundle tests cover timestamp ownership, collision handling, regeneration,
+copy fallback, and preserving the original three-file WiKi torrent payload. Legacy
+migration tests keep artifact IDs and download links, reject active jobs, and leave
+unrelated files intact. Text preview tests cover authentication, traversal, bounded
+reads, and NFO CP437 decoding. Native `tests.container_release` verifies torrent
+pieces against the inner payload inside the ART wrapper.
+
+`tests.container_screenshot_reservations` is an optional PostgreSQL concurrency test.
+Run it only against a disposable database named `screenshot_reservation_test`; it
+creates fixture rows and confirms simultaneous x264/x265 requests produce one winner
+and one conflict for frame 1000. Unit/API tests additionally cover nearby frames,
+the exact spacing boundary, gallery reservation markers, and deleted-job cleanup.
+Screenshot rendering tests check that the last row uses the final MKV filename.

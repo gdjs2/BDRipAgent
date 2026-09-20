@@ -44,12 +44,23 @@ they cannot shadow standard-library modules.
 
 ## Track extraction
 
-Track preparation runs one `mkvextract` command containing all selected audio and
-PGS track IDs in `tracks` mode, followed by the audio IDs in `timestamps_v2` mode.
-Both modes share one pass over the source. All requested files must exist and be
-nonempty before artifact registration or subtitle cropping starts. Empty selections
-skip extraction. Prepared tracks retain selection order, and retries write into
-the new task's output directory.
+Source analysis extracts all PGS tracks in one `mkvextract` pass for review before
+selection. Preparation reuses those original files and their detection results,
+extracting only selected audio and any missing/legacy PGS files in one further
+pass with audio `timestamps_v2`. All requested files must exist and be nonempty
+before registration/cropping. Empty selections skip extraction. Prepared tracks
+retain selection order; retries write new outputs under the new task directory.
+Metadata-based FFmpeg stream indexes are mapped separately from MKVToolNix IDs
+for local audio samples; unmatched streams are reported instead of guessed.
+
+Extraction, timestamp indexing and final merging enable MKVToolNix's
+[`--gui-mode`](https://mkvtoolnix.download/doc/mkvextract.html) and parse its
+untranslated progress records from the persistent task log once per second.
+Updates are saved on the task and sent through the existing `task_progress` SSE
+events. The frontend shows the current phase and the tool's reported percentage;
+it waits for an actual report before displaying determinate tool progress.
+Task progress stops at 99% until output checks and remaining processing succeed.
+Timestamp indexing occupies the first 5% of screenshot candidate generation.
 
 ## Sup2Sup
 
@@ -152,6 +163,26 @@ CRF mode generates `-q <crf> --no-two-pass`. Bitrate mode generates
 profile options for both passes. Both modes retain the source crop, dimensions,
 timestamps, encoder bit depth and existing validation/remux pipeline. One task
 owns both passes and occupies one queue slot; retries rerun the encoding stage.
+
+Running final encodes expose `POST /tasks/{id}/pause` and `/resume` (202). Both
+require an active, supported encoder and reject cancellation/terminal/other-stage
+requests. The worker advertises `can_pause` while supervising HandBrake, polls
+`pause_requested`, and acknowledges suspension through `paused_at` and task events.
+It sends SIGSTOP/SIGCONT to its own process group, retaining the current pass and
+output; the API never signals stored PIDs. Paused tasks remain RUNNING and reserve
+their queue slot. Heartbeats and cancellation continue, and paused time is excluded
+from command timeout/active elapsed time. Cancellation sends SIGTERM followed by
+SIGCONT so a stopped process can terminate. Completion, errors and lease recovery
+clear pause fields; retries create an unpaused attempt. Worker restart requires a
+fresh encode, not a resume from disk. Migration `0004` defaults old tasks to having
+no pause capability.
+
+The Encoding tab displays the saved profile snapshot (including tune, video
+profile/level and complete encoder options), rate control/passes, source/crop/output
+geometry, frame handling, filters, track/chapter handling and saved selection
+metadata. A JSON view retains all saved fields. The displayed HandBrake command
+comes from `command_json` on the latest encode attempt; a queued retry never shows
+an old command as its own, and smoke mode explicitly reports skipped encoding.
 Progress scales each pass into the overall percentage (0–50%, then 50–100%) and
 labels HandBrake's ETA as the time remaining in the current pass.
 
@@ -196,14 +227,61 @@ The token is calculated from the selected audio, not discarded source tracks.
 The upstream naming scheme assumes 1080p Blu-ray; other release classes remain a
 question in `open-questions.md`. The application does not upscale video to 1080p.
 
-The filename stem is also the MKV container title and encoded screenshot label.
+The filename stem is the MKV container title. The encoded screenshot’s last row
+shows the actual final MKV basename, including `.mkv`; smoke tests also identify
+the reused source. Source screenshots retain their `Source` label.
 Audio labels use e.g. `English DTS-MA 5.1` or `English Dolby Atmos 7.1`.
 Subtitle labels use e.g. `English PGS SDH Forced`; unset flags are omitted.
 Default, forced, hearing/visual impairment and commentary flags are explicitly
-written and inspected after remux. SDH is recognized from the Matroska hearing
-impairment flag or an existing SDH/CC/hearing-impaired track name. The V1 selection
-gate still accepts PGS subtitles; text subtitle label formatting is ready for a
-later extension, but does not imply new SRT/ASS processing support.
+written and inspected after remux. Subtitle SDH is determined from content, never
+copied from the source flag or name. All PGS tracks are rendered before selection through the
+pinned Sup2Sup parser, sampled uniformly across up to 96 distinct bitmap cues, and
+read with [Tesseract](https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage.html).
+[OpenCC](https://github.com/BYVoid/OpenCC) character dictionaries distinguish Chinese
+scripts; colloquial grammar identifies written Cantonese independently of script.
+Examples: `Simplified Chinese PGS`, `Traditional Chinese PGS SDH`, and
+`Cantonese (Traditional) PGS`, with IETF tags `zh-Hans`, `zh-Hant`, and `yue-Hant`.
+Japanese and Korean OCR packs avoid treating those scripts as Chinese.
+
+Program rules require multiple distinct cues and strong script evidence. Repeated
+explicit sound descriptions can establish SDH; absence of markers always requires
+visual agent review. Initial analysis always asks the agent to review SDH, including
+program-positive results. Ambiguous script/dialect or OCR disagreement also goes to the
+agent, which receives original cue images and OCR but no source track name or SDH
+flag. Prompts and responses stream on the Tracks page. A saved `SUBTITLE_DETECTION`
+report records coverage, source metadata for comparison, decisions, and evidence.
+The Tracks page displays detected names, descriptions and coverage before selection.
+
+A second streamed agent review receives all track evidence and recommends Default,
+Forced, Hearing impaired, Visual impaired/audio description and Commentary flags.
+It preserves the subtitle visual review's SDH decision. Unknown content flags stay
+null until the user explicitly chooses Yes/No on selected tracks. The selection
+API accepts `track_names: {track_id: name}` and `track_flags: {track_id: {flag: bool}}`
+for selected tracks only. Overrides are stored alongside evidence in track metadata;
+manual names are single-line Unicode strings of 1–255 characters. They are passed
+as argv values, preserved through retries, and verified after MKVToolNix merging.
+No database migration is required. Editing a label alone does not alter flags.
+
+Audio is decoded locally to mono 16 kHz WAV samples for analysis only; the final
+output retains original audio. The worker's isolated faster-whisper environment
+runs CPU int8 inference under a shared cache lock to bound concurrent memory/CPU
+use. The agent receives transcripts, confidence, timestamps, signal measurements,
+and metadata, never raw audio. `integrations.audio_review` configures transcription
+(default true), model (default `small`, also accepts an installed model path),
+sample_count (1–8, default 3), sample_seconds (5–60, default 30), and cpu_threads
+(1–8, default 2). Model weights download on first use into `cache/speech-models`.
+Thereafter cached models can run offline. If decoding or transcription fails, the
+review reports that limitation rather than fabricating content. `AUDIO_ANALYSIS`,
+`AUDIO_SAMPLE`, `AUDIO_TRANSCRIPTS`, and `TRACK_REVIEW` artifacts preserve evidence.
+
+This is content sampling, not exhaustive transcription. Inconclusive subtitle
+findings remain visible before selection; a user may explicitly override SDH.
+Unresolved language/script still stops preparation instead of guessing. Increase
+`integrations.subtitle_detection.sample_cues` (8–192) and retry to widen evidence.
+`POST /jobs/{id}/tracks/analyze` lets waiting jobs rerun initial review; it refuses
+already selected or active jobs. Older prepared jobs are checked before their next
+mux. Existing outputs are not modified. Rebuild worker, agent, API and frontend.
+The selection gate continues to accept PGS only.
 
 ## Codex screenshot selection
 
@@ -249,11 +327,21 @@ rule; rendering rechecks actual decoded types before writing each image pair.
 Candidate records store `b_frames_verified`, source `picture_type` and
 `encoded_picture_type`. Final PNGs retain the original crop and resolution.
 
-The Python service wraps `codex exec` with image attachments, strict JSON Schema
-output, a read-only sandbox, disabled shell tools and web search, no interactive
-approvals, and an explicit timeout. The pinned CLI is installed in the agent image.
-No unverified Python SDK dependency is assumed. This follows the documented
-[noninteractive interface](https://learn.chatgpt.com/docs/non-interactive-mode).
+The Python service uses the pinned CLI's `codex app-server --stdio` protocol,
+with ephemeral read-only threads, image attachments, a strict `outputSchema`,
+disabled shell tools and web search, no interactive approvals, and an explicit
+timeout. It consumes `item/agentMessage/delta` and completed agent messages from the
+[documented app-server interface](https://learn.chatgpt.com/docs/app-server).
+Reasoning events are not forwarded to the browser.
+
+The worker requests an NDJSON stream from the internal agent service. Each invocation
+emits its full prompt and attachment names, followed by response text deltas and a
+completed message. The worker batches deltas and persists fenced `agent_output` events.
+Authenticated `GET /api/tasks/{id}/agent-events` replays that attempt's transcript and
+streams new records, honoring `Last-Event-ID`. The screenshot page separates shortlist,
+review, and correction requests, and offers earlier attempts. Heartbeats keep the
+connection open and allow worker cancellation checks; disconnecting cancels the agent
+subprocess. The JSON response mode remains available for older internal callers.
 
 Authenticate inside the container using the documented
 [device-code login](https://learn.chatgpt.com/docs/auth):
@@ -317,7 +405,7 @@ Newer task attempts also clear stale retry errors in the web interface.
 
 `SCREENSHOT_RENDERING` advances to `WAITING_FOR_RELEASE_DETAILS`. The Release tab
 collects required `chinese_name` and `source`, optional `extra_description`, and one HTTP(S)/UDP `tracker`
-announce URL. `PATCH /api/jobs/{id}/release` saves these fields in
+announce URL, plus `upload_screenshots` (default `false`). `PATCH /api/jobs/{id}/release` saves these fields in
 `analysis.release_details`; `POST` on the same route confirms them and queues
 `GENERATING_RELEASE`. Completed older jobs can use the same endpoint once their
 selected comparison PNGs exist. Active tasks lock release editing. Successful
@@ -351,17 +439,23 @@ The agent service has no access to this token.
 
 Only `Screenshot.selected` rows with complete, B-frame-verified final comparison
 paths are accepted. Source files are sorted before encoded files in every BBCode
-row. The 40-frame shortlist and unused best-15 previews are never uploaded. Upload
+row. With uploads disabled, no upload helper is called and no cached URLs are reused;
+the BBCode comparison heading remains with an empty image section. No TTG token is
+required. Legacy saved requests lacking the flag preserve their original upload behavior
+on task retry. The 40-frame shortlist and unused best-15 previews are never uploaded. Upload
 URLs are cached per image-set fingerprint, and retries include both failed images
 and images not reached before interruption. Any missing upload fails the stage
 instead of silently publishing a partial comparison section.
 
-The package contains the final MKV plus its NFO and MD5. The MKV is hard-linked
-within completed storage, with a copy fallback on filesystems without hard links.
-BBCode and the private v1 torrent are outside the torrent payload; every torrent
-piece is verified against the package before success. No announce/seeding or
-tracker submission is performed. Progress reports upload counts, MD5 phase, and
-torrent hashing/verification counts through the existing task/log APIs.
+The private v1 torrent, BBCode, encoder notes, and unchanged WiKi payload directory
+share `ARTIFACTS_ROOT/<UTC timestamp> [ART] <release-name>/`. The timestamp is allocated
+at first export and reused by the same job. A separate torrent root is no longer
+required. The authenticated artifact preview endpoint returns bounded plain-text
+JSON for BBCode/NFO/MD5/encoder files; the Release tab renders it as selectable text.
+Legacy exports can be relocated with `worker.pipeline.release_migration` before
+removing the old torrent directory, preserving artifact IDs, torrent bytes, and payload.
+The launcher performs this migration automatically on upgrade using a temporary
+legacy mount. NFO previews decode the upstream CP437 artwork; other text uses UTF-8.
 
 IMDb release metadata is fetched once with a bounded subprocess and cached for
 retries. A failed lookup uses the saved title/year and explicit Unknown/N/A fields,
@@ -407,3 +501,11 @@ Media/frame handling uses [PyAV](https://pyav.basswood.io/docs/stable/api/video.
 The worker image's actual HandBrake 1.6.1 and MKVToolNix binaries are exercised by
 the container smoke test; newer documentation may list additional flags that this
 implementation does not use.
+
+The screenshot gallery polls current cross-codec reservations and disables identical
+or nearby frames before confirmation. The authoritative confirmation/replacement
+check uses a PostgreSQL transaction advisory lock for the immutable source, so two
+simultaneous requests cannot both reserve conflicting frames. The larger of the two
+jobs' spacing settings applies (30 seconds by default); exact frame reuse is forbidden
+even with zero spacing. Deleted jobs do not reserve frames. Smoke-test variants
+reserve against other smoke variants while remaining independent of real releases.

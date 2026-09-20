@@ -12,7 +12,7 @@ from backend.app.services import event
 from shared.config import behavior, get_settings
 from shared.db import session
 from shared.models import Artifact, MovieJob, Task, now
-from shared.paths import contained, job_dir
+from shared.paths import artifact_root, contained, job_dir
 
 
 class Interrupted(RuntimeError):
@@ -23,6 +23,64 @@ class ToolError(RuntimeError):
     def __init__(self, command, exit_code):
         super().__init__(f"{command[0]} exited with code {exit_code}; see persistent task log")
         self.exit_code = exit_code
+
+
+class EncodingPause:
+    """Worker-owned process signals; API requests never operate on persisted PIDs."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.started = None
+        self.total = 0.0
+
+    @property
+    def seconds(self):
+        return self.total + (time.monotonic() - self.started if self.started is not None else 0)
+
+    def checked_task(self, db):
+        task = db.scalar(select(Task).where(Task.id == self.ctx.task_id).with_for_update())
+        if not task or task.status != "RUNNING" or task.run_token != self.ctx.token or task.cancel_requested:
+            self.ctx.lost.set()
+            self.ctx.check()
+        if task.type != "encode":
+            raise ValueError("Only final encoding commands support pause")
+        return task
+
+    def enable(self):
+        with session() as db:
+            task = self.checked_task(db)
+            task.can_pause = True
+            event(db, task.job_id, "task_pause_available", task_id=task.id)
+            db.commit()
+
+    def disable(self):
+        with session() as db:
+            task = db.scalar(select(Task).where(Task.id == self.ctx.task_id).with_for_update())
+            if task and task.run_token == self.ctx.token:
+                task.can_pause, task.pause_requested, task.paused_at = False, False, None
+                event(db, task.job_id, "task_pause_unavailable", task_id=task.id)
+                db.commit()
+
+    def sync(self, process):
+        with session() as db:
+            task = self.checked_task(db)
+            pause = task.pause_requested
+            if pause == (self.started is not None):
+                return
+            try:
+                os.killpg(process.pid, signal.SIGSTOP if pause else signal.SIGCONT)
+            except ProcessLookupError:
+                return  # Encoder finished concurrently; command cleanup clears the controls.
+            if pause:
+                self.started = time.monotonic()
+                task.paused_at = now()
+            else:
+                self.total += time.monotonic() - self.started
+                self.started = None
+                task.paused_at = None
+            event(db, task.job_id, "task_paused" if pause else "task_resumed", task_id=task.id)
+            db.commit()
+        self.ctx.log("Encoding paused; progress is retained." if pause else "Encoding resumed.")
 
 
 class TaskContext:
@@ -93,6 +151,16 @@ class TaskContext:
             event(db, task.job_id, "task_progress", task_id=task.id, progress=task.progress, **detail)
             db.commit()
 
+    def agent_event(self, data):
+        self.check()
+        with session() as db:
+            task = db.scalar(select(Task).where(Task.id == self.task_id).with_for_update())
+            if task.status != "RUNNING" or task.run_token != self.token or task.cancel_requested:
+                self.lost.set()
+                self.check()
+            event(db, task.job_id, "agent_output", task_id=task.id, **data)
+            db.commit()
+
     def run(
         self,
         command,
@@ -102,6 +170,7 @@ class TaskContext:
         progress_parser=None,
         progress_reader=None,
         env: dict[str, str] | None = None,
+        pausable: bool = False,
     ):
         self.check()
         argv = [str(x) for x in command]
@@ -115,6 +184,7 @@ class TaskContext:
             begin = log.tell()
             stdout = output.open("wb") if output else log
             process = None
+            pause = EncodingPause(self) if pausable else None
             try:
                 process = subprocess.Popen(
                     argv,
@@ -125,7 +195,12 @@ class TaskContext:
                     cwd=self.workspace,
                     env={**os.environ, **env} if env is not None else None,
                 )
+                if pause:
+                    pause.enable()
                 cursor = begin
+
+                def active_seconds():
+                    return time.monotonic() - start - (pause.seconds if pause else 0)
 
                 def publish_progress():
                     nonlocal cursor
@@ -141,14 +216,17 @@ class TaskContext:
                     if update:
                         detail = dict(update)
                         percentage = detail.pop("percentage")
-                        detail.setdefault("elapsed_seconds", time.monotonic() - start)
+                        detail.setdefault("elapsed_seconds", active_seconds())
                         self.progress(percentage, **detail)
 
                 while process.poll() is None:
                     self.check()
-                    if time.monotonic() - start > behavior()["command_timeout_seconds"]:
+                    if pause:
+                        pause.sync(process)
+                    if active_seconds() > behavior()["command_timeout_seconds"]:
                         raise TimeoutError(f"{argv[0]} exceeded configured timeout")
-                    publish_progress()
+                    if not pause or pause.started is None:
+                        publish_progress()
                     time.sleep(1)
                 self.check()
                 publish_progress()
@@ -157,15 +235,24 @@ class TaskContext:
                 if process.returncode:
                     self.log(f"Tool completed with warnings (exit {process.returncode})")
             finally:
-                if process and process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-                if output:
-                    stdout.close()
+                try:
+                    if process and process.poll() is None:
+                        try:
+                            # SIGTERM is pending while stopped; SIGCONT lets it take effect.
+                            os.killpg(process.pid, signal.SIGTERM)
+                            os.killpg(process.pid, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait()
+                finally:
+                    if output:
+                        stdout.close()
+                    if pause:
+                        pause.disable()
         if output:
             return output.read_text(errors="replace")
         with self.log_path.open("rb") as reader:
@@ -174,7 +261,7 @@ class TaskContext:
 
     def artifact(self, path, kind, *, info=None, storage="workspace"):
         self.check()
-        root = self.settings.completed_root if storage == "completed" else self.workspace
+        root = artifact_root(self.settings, self.job.id, storage)
         relative = str(path.relative_to(root))
         safe = contained(root, relative, exists=True)
         with session() as db:
@@ -182,6 +269,7 @@ class TaskContext:
             if not row:
                 row = Artifact(job_id=self.job.id, path=relative, task_id=self.task_id)
                 db.add(row)
+            row.task_id = self.task_id
             row.artifact_type, row.storage = kind, storage
             row.size, row.info = safe.stat().st_size, info or {}
             db.flush()

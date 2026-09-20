@@ -11,6 +11,7 @@ def environment(tmp_path, monkeypatch):
         ("SOURCE_ROOT", "incoming"),
         ("WORKSPACE_ROOT", "jobs"),
         ("COMPLETED_ROOT", "completed"),
+        ("ARTIFACTS_ROOT", "artifacts"),
         ("CACHE_ROOT", "cache"),
     ]:
         path = tmp_path / folder

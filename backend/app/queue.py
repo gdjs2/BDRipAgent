@@ -24,7 +24,7 @@ def settings(db, *, lock=False):
 
 
 def running_count(db):
-    # Include cancellation requests until their process has actually stopped.
+    # Paused encodes retain their slot. Count cancellations until the process has stopped.
     return db.scalar(select(func.count()).select_from(Task).where(Task.status == "RUNNING"))
 
 
@@ -67,6 +67,9 @@ def snapshot(db):
             "held": task.held,
             "progress": task.progress,
             "cancel_requested": task.cancel_requested,
+            "can_pause": task.can_pause,
+            "pause_requested": task.pause_requested,
+            "paused_at": task.paused_at,
             "created_at": task.created_at,
         }
 

@@ -155,6 +155,19 @@ def main():
             screenshots, "upload_image", side_effect=AssertionError("Cached files must not upload again")
         ):
             run(request, "fixture-token")
+        # Disabling uploads must ignore even successfully cached URLs and work
+        # without a token, while retaining the upstream empty section heading.
+        offline = {**request, "details": {**request["details"], "upload_screenshots": False}}
+        with patch.object(
+            screenshots, "upload_screenshots_cached", side_effect=AssertionError("No uploads requested")
+        ):
+            offline_result = run(offline, "")
+        offline_post = (root / "output" / (movie.stem + ".bbcode.txt")).read_text()
+        assert ".Comparisons" in offline_post and "[URL=" not in offline_post
+        assert "images.example" not in offline_post
+        assert offline_result["uploaded_images"] == 0 and offline_result["screenshots"] == []
+        assert offline_result["upload_screenshots"] is False
+        assert verify_torrent(torrent_path, package)
         normal_movie = root / "Movie.2026.x264-WiKi.mkv"
         normal_movie.hardlink_to(movie)
         normal_request = {
@@ -171,6 +184,27 @@ def main():
         normal_post = (root / "normal-output" / f"{normal_movie.stem}.bbcode.txt").read_text()
         assert not normal_result["smoke_test"] and "frame I:" in normal_post
         assert "SMOKE TEST" not in normal_post and ".x264.Info" in normal_post
+        from uuid import uuid4
+
+        from worker.pipeline.release_exports import publish
+
+        ctx = SimpleNamespace(
+            check=lambda: None,
+            job=SimpleNamespace(id=str(uuid4()), release_name=normal_movie.stem),
+            settings=SimpleNamespace(
+                workspace_root=root / "jobs",
+                completed_root=root,
+                artifacts_root=root / "artifacts",
+            ),
+        )
+        exported = publish(ctx, [{**item, "storage": "completed"} for item in normal_result["artifacts"]])
+        public_torrent = next(Path(item["path"]) for item in exported if item["kind"] == "RELEASE_TORRENT")
+        public_package = public_torrent.parent / normal_movie.stem
+        assert public_torrent.parent.parent == root / "artifacts"
+        assert " [ART] " in public_torrent.parent.name
+        assert public_torrent.name == normal_movie.stem + ".torrent"
+        assert verify_torrent(public_torrent, public_package)
+        assert Torrent.read(public_torrent).name == public_package.name
         print(
             "PASS: real BDRip_Scripts BBCode/NFO/MD5/private torrent, piece verification, source-left pairs, resumable uploads, selected-only images, hard-linked media, and unchanged original MKV."
         )

@@ -266,3 +266,58 @@ def test_overlay_matches_supplied_reference_geometry(filename, label):
     report = compare(reference, rendered)
     # A metrically similar open font: glyph rasterization differs from the reference.
     assert report["yellow_mask_iou"] > 0.45, report
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+def test_comparison_last_row_uses_actual_final_movie_filename(tmp_path, monkeypatch, smoke):
+    from fractions import Fraction
+    from types import SimpleNamespace
+
+    from worker.pipeline import screenshots
+
+    frame = SimpleNamespace(pict_type=3, pts=1000, time_base=Fraction(1, 24))
+    monkeypatch.setattr(screenshots, "extract_at", lambda *a: frame)
+    monkeypatch.setattr(screenshots, "cropped_image", lambda *a: Image.new("RGB", (1920, 1080), "gray"))
+    monkeypatch.setattr(screenshots, "rgb_image", lambda *a: Image.new("RGB", (1920, 1080), "gray"))
+    (tmp_path / "video.mkv").touch()
+    artifacts = []
+
+    def artifact(path, kind, **kwargs):
+        artifacts.append((kind, kwargs["info"]))
+        assert Image.open(path).size == (1920, 1080)
+        return path.name
+
+    ctx = SimpleNamespace(
+        workspace=tmp_path,
+        check=lambda: None,
+        source=lambda: tmp_path / "source.mkv",
+        progress=lambda *a, **kw: None,
+        output=lambda category, name: tmp_path / name,
+        artifact=artifact,
+        job=SimpleNamespace(
+            release_name="Stale.Title-WiKi",
+            analysis={
+                "smoke_test": smoke,
+                "crop": {"left": 0, "top": 0, "right": 0, "bottom": 0},
+                "video": {},
+                "encoded_path": "video.mkv",
+                "final_path": "job/Actual.Movie.x265-WiKi.mkv",
+            },
+            validation={"metrics": {"source_first_pts": 0, "encoded_first_pts": 0}},
+        ),
+    )
+    shot = SimpleNamespace(
+        id="shot",
+        candidate_id=1,
+        info={
+            "source_pts_seconds": 1000 / 24,
+            "source_frame_number": 1000,
+            "source_total_frames": 5000,
+        },
+    )
+    screenshots.render_pairs(ctx, [shot])
+    assert artifacts[0][1]["overlay_label"] == "Source"
+    expected = "Actual.Movie.x265-WiKi.mkv"
+    assert artifacts[1][1]["overlay_label"] == (
+        "SMOKE TEST - Source reused | " + expected if smoke else expected
+    )

@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 from shared.paths import contained
+from worker.adapters.mkvtoolnix import MKVToolNixProgress
 
 
 def frame_number(points, pts, tolerance=0.003):
@@ -21,14 +22,17 @@ def source_frame_index(ctx):
         points = np.load(contained(ctx.workspace, cached, exists=True), allow_pickle=False)
     else:
         ctx.log("Indexing Matroska frame timestamps without decoding video.")
-        ctx.progress(0, phase="Indexing frame timestamps")
+        ctx.progress(0, phase="Indexing frame timestamps", tool="mkvextract")
         source = ctx.source()
         metadata = json.loads(ctx.run([ctx.settings.mkvmerge_bin, "-J", source]))
         videos = [track for track in metadata["tracks"] if track["type"] == "video"]
         if len(videos) != 1:
             raise ValueError("Screenshot indexing requires exactly one video track")
         path = ctx.output("screenshots", "source-timestamps.txt")
-        ctx.run([ctx.settings.mkvextract_bin, source, "timestamps_v2", f"{videos[0]['id']}:{path}"])
+        ctx.run(
+            [ctx.settings.mkvextract_bin, source, "timestamps_v2", f"{videos[0]['id']}:{path}", "--gui-mode"],
+            progress_parser=MKVToolNixProgress("mkvextract", "Indexing frame timestamps", progress_span=5),
+        )
         points = np.loadtxt(path, comments="#", ndmin=1) / 1000
         # Matroska stores B-frames in decode order; the exported timecodes are
         # presentation ordered by mkvextract. Check instead of guessing from FPS.

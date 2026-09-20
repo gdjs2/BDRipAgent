@@ -30,15 +30,14 @@ def codec_for(db, job):
 
 
 def other_variant_frames(db, job):
-    # Test selections must not reserve frames for a real release (or vice versa).
-    if is_smoke_test(job):
-        return []
+    # Smoke variants reserve against each other, independently of real releases.
     codec = codec_for(db, job)
     rows = db.execute(
         select(MovieJob, Screenshot)
         .join(Screenshot, Screenshot.job_id == MovieJob.id)
         .where(
             MovieJob.id != job.id,
+            MovieJob.deleted_at.is_(None),
             MovieJob.source_path == job.source_path,
             MovieJob.source_size == job.source_size,
             MovieJob.source_mtime_ns == job.source_mtime_ns,
@@ -49,21 +48,30 @@ def other_variant_frames(db, job):
         {
             **shot.info,
             "job_id": peer.id,
+            "codec": codec_for(db, peer),
             "spacing": max(
                 job.screenshot_policy["min_spacing_seconds"], peer.screenshot_policy["min_spacing_seconds"]
             ),
         }
         for peer, shot in rows
-        if not is_smoke_test(peer) and codec_for(db, peer) != codec
+        if is_smoke_test(peer) == is_smoke_test(job) and codec_for(db, peer) != codec
     ]
 
 
-def conflicts(candidate, reserved):
-    return any(
-        candidate["source_frame_number"] == r["source_frame_number"]
-        or abs(candidate["timeline_seconds"] - r["timeline_seconds"]) < r["spacing"]
-        for r in reserved
+def reservation_for(candidate, reserved):
+    return next(
+        (
+            r
+            for r in reserved
+            if candidate["source_frame_number"] == r["source_frame_number"]
+            or abs(candidate["timeline_seconds"] - r["timeline_seconds"]) < r["spacing"]
+        ),
+        None,
     )
+
+
+def conflicts(candidate, reserved):
+    return reservation_for(candidate, reserved) is not None
 
 
 def check_other_variants(db, job, candidates):

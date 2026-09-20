@@ -563,6 +563,34 @@ textarea {
   margin: 0;
   font-size: 12px;
 }
+.track h3 label {
+  margin: 0;
+  color: inherit;
+  font-size: inherit;
+}
+.subtitle-description,
+.track-name-field {
+  margin-top: 12px;
+}
+.subtitle-description small,
+.track-name-field small {
+  display: block;
+  margin-top: 6px;
+}
+.track-flags {
+  margin: 16px 0 0;
+  border: 1px solid #343b44;
+  border-radius: 5px;
+  padding: 12px;
+}
+.track-flag-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  gap: 10px;
+}
+.track-name-field button {
+  margin-top: 6px;
+}
 .disabled {
   opacity: 0.55;
 }
@@ -982,4 +1010,48 @@ pre {
 }
 .task-log {
   margin-top: 32px;
+}
+
+.agent-transcript pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 28rem;
+  overflow: auto;
+}
+.agent-transcript article + article {
+  border-top: 1px solid var(--border, #303947);
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+}
+.agent-transcript summary {
+  cursor: pointer;
+}
+
+.release-text-preview {
+  margin-top: 1.5rem;
+}
+.release-text-preview pre {
+  max-height: 36rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.encoding-pause-control {
+  display: inline-block;
+  margin-right: 10px;
+}
+
+.encoding-configuration th {
+  width: 32%;
+  text-align: left;
+  color: #b6bdc7;
+  vertical-align: top;
+}
+.encoding-configuration td {
+  overflow-wrap: anywhere;
+}
+.encoding-configuration pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

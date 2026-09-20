@@ -4,6 +4,7 @@ x-app-env: &app-env
   SOURCE_ROOT: /source
   WORKSPACE_ROOT: /workspace
   COMPLETED_ROOT: /completed
+  ARTIFACTS_ROOT: /artifacts
   CACHE_ROOT: /cache
   API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env}
   AGENT_TOKEN: ${AGENT_TOKEN:?Set AGENT_TOKEN in .env}
@@ -34,6 +35,7 @@ services:
       - ${STORAGE_ROOT:-./data}/incoming:/source:ro
       - ${STORAGE_ROOT:-./data}/jobs:/workspace
       - ${STORAGE_ROOT:-./data}/completed:/completed:ro
+      - ${STORAGE_ROOT:-./data}/artifacts:/artifacts:ro
       - ./config:/app/config:ro
       - ./profiles:/app/profiles:ro
     depends_on:
@@ -62,6 +64,7 @@ services:
       - ${STORAGE_ROOT:-./data}/incoming:/source:ro
       - ${STORAGE_ROOT:-./data}/jobs:/workspace
       - ${STORAGE_ROOT:-./data}/completed:/completed
+      - ${STORAGE_ROOT:-./data}/artifacts:/artifacts
       - ${STORAGE_ROOT:-./data}/cache:/cache
       - ./config:/app/config:ro
       - ./profiles:/app/profiles:ro

@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { EncodingPauseButton } from "./EncodingPauseButton";
+import { encodingPauseState } from "./encoding-pause";
 import { api, readable } from "./api";
 
 type QueueTask = {
@@ -14,6 +16,9 @@ type QueueTask = {
   held: boolean;
   progress: number;
   cancel_requested: boolean;
+  can_pause?: boolean;
+  pause_requested?: boolean;
+  paused_at?: string | null;
 };
 type QueueState = {
   max_concurrent_jobs: number;
@@ -161,8 +166,10 @@ export function QueuePage() {
               decision use no slot.
             </p>
             <p className="muted">
-              Pausing or lowering the limit lets current work finish its stage.
-              Higher limits share CPU and memory between jobs.
+              Pause queue stops new work from starting. Use Pause encoding on a
+              running encode to suspend it and retain its progress. Paused
+              encodes keep their slots. Higher limits share CPU and memory
+              between jobs.
             </p>
           </section>
           <section>
@@ -180,8 +187,10 @@ export function QueuePage() {
                   </span>
                 </Link>
                 <span className="badge">
-                  {task.cancel_requested ? "Stopping" : "Running"}
+                  {encodingPauseState(task)?.status ??
+                    (task.cancel_requested ? "Stopping" : "Running")}
                 </span>
+                <EncodingPauseButton task={task} />
                 <Link
                   to={`/jobs/${task.job_id}/${task.type === "crf_analysis" ? "crf" : "encode"}`}
                 >

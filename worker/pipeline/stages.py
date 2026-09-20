@@ -10,9 +10,13 @@ from shared.encoding import is_smoke_test
 from shared.models import CRFResult, EncodeConfig, MovieJob, MovieTrack, TrackSelection
 from shared.naming import release_name, track_name
 from shared.paths import contained, job_dir, write_json
+from shared.subtitles import subtitle_is_resolved
 from worker.adapters.handbrake import Crop, encode_command, parse_progress
 from worker.adapters.integrations import CRFStudioAdapter, Sup2supAdapter
 from worker.adapters.media import AUDIO_EXTENSIONS, analyze, probe, video_metadata
+from worker.adapters.mkvtoolnix import MKVToolNixProgress
+from worker.adapters.subtitles import classify as classify_subtitle
+from worker.adapters.track_review import review_tracks
 from worker.pipeline.validation import EncodeValidator, timeline
 
 
@@ -25,6 +29,43 @@ def update_analysis(extra):
 
 def analyze_source(ctx):
     result = analyze(ctx)
+    subtitles = [
+        t for t in result["tracks"] if t["kind"] == "subtitles" and t.get("codec_id") == "S_HDMV/PGS"
+    ]
+    paths = {t["track_id"]: ctx.output("subtitles", f"track-{t['track_id']}.sup") for t in subtitles}
+    if subtitles:
+        phase = "Extracting subtitles for track review"
+        ctx.progress(0, phase=phase, tool="mkvextract")
+        ctx.run(
+            [
+                ctx.settings.mkvextract_bin,
+                ctx.source(),
+                "tracks",
+                *(f"{track_id}:{path}" for track_id, path in paths.items()),
+                "--gui-mode",
+            ],
+            progress_parser=MKVToolNixProgress("mkvextract", phase),
+        )
+        for track_id, path in paths.items():
+            if not path.is_file() or not path.stat().st_size:
+                raise ValueError(f"Track {track_id} extraction produced no data")
+    reviewed = {}
+    for index, track in enumerate(subtitles, 1):
+        track_id = track["track_id"]
+        ctx.check()
+        ctx.log(f"Analyzing subtitle {index}/{len(subtitles)} (track {track_id}) before track selection")
+        original = ctx.artifact(paths[track_id], "SUBTITLE_ORIGINAL", info={"track_id": track_id})
+        reviewed[track_id] = classify_subtitle(
+            ctx,
+            {**track, "subtitle_source_path": original},
+            paths[track_id],
+            require_confident=False,
+            agent_review=True,
+        )
+    result["tracks"] = [reviewed.get(t["track_id"], t) for t in result["tracks"]]
+    result["subtitle_analysis_version"] = 1
+    result["tracks"] = review_tracks(ctx, result)
+    result["track_review_version"] = 1
     path = ctx.output("metadata", "normalized.json")
     write_json(path, result)
     ctx.artifact(path, "SOURCE_METADATA")
@@ -45,21 +86,32 @@ def prepare_tracks(ctx):
     crop = Crop(**ctx.job.analysis["crop"])
     tracks = {t["track_id"]: t for t in ctx.job.analysis["tracks"]}
     extraction = []
+    pending = []
     for track_id in [*selection.audio_track_ids, *selection.subtitle_track_ids]:
         track = tracks[track_id]
         audio = track["kind"] == "audio"
         extension = AUDIO_EXTENSIONS[track["codec_id"]] if audio else "sup"
-        path = ctx.output("audio" if audio else "subtitles", f"track-{track_id}.{extension}")
+        cached = track.get("subtitle_source_path") if not audio else None
+        path = contained(ctx.workspace, cached) if cached else None
+        reuse = path is not None and path.is_file() and path.stat().st_size > 0
+        if not reuse:
+            path = ctx.output("audio" if audio else "subtitles", f"track-{track_id}.{extension}")
         timestamps = ctx.output("audio", f"track-{track_id}.timestamps.txt") if audio else None
-        extraction.append((track, path, timestamps))
+        entry = (track, path, timestamps)
+        extraction.append(entry)
+        if not reuse:
+            pending.append(entry)
 
-    if extraction:
+    if pending:
         command = [ctx.settings.mkvextract_bin, source, "tracks"]
-        command += [f"{track['track_id']}:{path}" for track, path, _ in extraction]
-        timestamp_specs = [f"{track['track_id']}:{ts}" for track, _, ts in extraction if ts is not None]
+        command += [f"{track['track_id']}:{path}" for track, path, _ in pending]
+        timestamp_specs = [f"{track['track_id']}:{ts}" for track, _, ts in pending if ts is not None]
         if timestamp_specs:
             command += ["timestamps_v2", *timestamp_specs]
-        ctx.run(command)
+        command.append("--gui-mode")
+        ctx.progress(0, phase="Extracting selected tracks", tool="mkvextract")
+        ctx.run(command, progress_parser=MKVToolNixProgress("mkvextract", "Extracting selected tracks"))
+        ctx.progress(99, phase="Checking extracted tracks")
 
     # Check the whole batch before registering artifacts or processing subtitles.
     for track, path, timestamps in extraction:
@@ -78,6 +130,9 @@ def prepare_tracks(ctx):
         if audio:
             item["timestamps"] = ctx.artifact(timestamps, "AUDIO_TIMESTAMPS")
         else:
+            ctx.progress(99, phase=f"Processing subtitle track {track_id}")
+            if not subtitle_is_resolved(item):
+                item = classify_subtitle(ctx, item, path)
             cropped = ctx.output("subtitles", f"track-{track_id}.cropped.sup")
             Sup2supAdapter().crop(ctx, path, cropped, crop, ctx.job.analysis["video"])
             item["path"] = ctx.artifact(cropped, "SUBTITLE_CROPPED", info={"track_id": track_id})
@@ -90,10 +145,21 @@ def prepare_tracks(ctx):
     )
 
     def save(db, job):
-        job.analysis = {**job.analysis, "prepared_tracks": prepared}
+        save_prepared_tracks(db, job, prepared)
         job.release_name = name
 
     return save
+
+
+def save_prepared_tracks(db, job, prepared):
+    detected = {t["track_id"]: t for t in prepared if t["kind"] == "subtitles"}
+    tracks = [detected.get(t["track_id"], t) for t in job.analysis.get("tracks", [])]
+    job.analysis = {**job.analysis, "prepared_tracks": prepared, "tracks": tracks}
+    for row in db.scalars(
+        select(MovieTrack).where(MovieTrack.job_id == job.id, MovieTrack.kind == "subtitles")
+    ):
+        if row.track_id in detected:
+            row.info = detected[row.track_id]
 
 
 def crf_analysis(ctx):
@@ -149,6 +215,7 @@ def encode(ctx):
             bitrate_kbps=config.get("bitrate_kbps"),
         ),
         progress_parser=parse_progress,
+        pausable=True,
     )
     path = ctx.artifact(output, "ENCODED_VIDEO")
     stats = {}
@@ -215,6 +282,7 @@ def mux_command(ctx, output):
     video_offset_ms = (metrics["source_first_pts"] - metrics["encoded_first_pts"]) * 1000
     command = [
         ctx.settings.mkvmerge_bin,
+        "--gui-mode",
         "-o",
         str(output),
         "--title",
@@ -280,6 +348,14 @@ def mux(ctx):
         raise ValueError("Smoke remux requires a readable source and explicitly skipped encode validation")
     if not smoke and not ctx.job.validation.get("valid"):
         raise ValueError("Remux requires a passing validation report")
+    # Older prepared jobs also need content detection before any inherited flags
+    # reach a new output. Persist it with the successful mux result.
+    prepared = []
+    for track in ctx.job.analysis["prepared_tracks"]:
+        if track["kind"] == "subtitles" and not subtitle_is_resolved(track):
+            track = classify_subtitle(ctx, track, contained(ctx.workspace, track["path"], exists=True))
+        prepared.append(track)
+    ctx.job.analysis = {**ctx.job.analysis, "prepared_tracks": prepared}
     directory = job_dir(ctx.settings.completed_root, ctx.job.id)
     directory.mkdir(parents=True, exist_ok=True)
     temporary = directory / f"{ctx.task_id}.partial.mkv"
@@ -299,7 +375,9 @@ def mux(ctx):
         },
     )
     ctx.artifact(plan, "MUX_PLAN")
-    ctx.run(command, allowed=(0, 1))
+    ctx.progress(0, phase="Merging final MKV", tool="mkvmerge")
+    ctx.run(command, allowed=(0, 1), progress_parser=MKVToolNixProgress("mkvmerge", "Merging final MKV"))
+    ctx.progress(99, phase="Checking merged file")
     inspection = json.loads(
         ctx.run([ctx.settings.mkvmerge_bin, "-J", temporary], output=ctx.output("mux", "inspection.json"))
     )
@@ -311,6 +389,16 @@ def mux(ctx):
         p = actual["properties"]
         if p.get("track_name") != track_name(expected):
             raise ValueError("Final mux track name does not match the naming policy")
+        if (
+            expected["kind"] == "subtitles"
+            and expected.get("subtitle_detection", {}).get("language")
+            in (
+                "chinese",
+                "cantonese",
+            )
+            and p.get("language_ietf", "").lower() != expected["language"].lower()
+        ):
+            raise ValueError("Final mux subtitle language does not match content detection")
         for flag, key in (
             ("default_track", "default"),
             ("forced_track", "forced"),
@@ -323,7 +411,12 @@ def mux(ctx):
     ctx.check()
     temporary.replace(output)
     ctx.artifact(output, "SMOKE_TEST_MKV" if smoke else "FINAL_MKV", storage="completed")
-    return update_analysis({"final_path": str(output.relative_to(ctx.settings.completed_root))})
+
+    def save(db, job):
+        save_prepared_tracks(db, job, prepared)
+        job.analysis = {**job.analysis, "final_path": str(output.relative_to(ctx.settings.completed_root))}
+
+    return save
 
 
 def generate_candidates(ctx):

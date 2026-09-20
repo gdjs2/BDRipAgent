@@ -43,6 +43,14 @@ integrations:
     count: 10
     seconds: 10.0
     seed: 0
+  audio_review:
+    transcription: true
+    model: small
+    sample_count: 3
+    sample_seconds: 30
+    cpu_threads: 2
+  subtitle_detection:
+    sample_cues: 96
   sup2sup:
     fit: margin
     margin: 20

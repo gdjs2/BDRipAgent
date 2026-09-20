@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     source_root: Path = Path("/source")
     workspace_root: Path = Path("/workspace")
     completed_root: Path = Path("/completed")
+    artifacts_root: Path = Path("/artifacts")
     cache_root: Path = Path("/cache")
     config_path: Path = ROOT / "config/application.yaml"
     profiles_root: Path = ROOT / "profiles"
@@ -32,6 +33,7 @@ class Settings(BaseSettings):
     ffmpeg_bin: str = "ffmpeg"
     crf_studio_bin: str = "/opt/crf-studio/.venv/bin/bdrip"
     sup2sup_bin: str = "/opt/sup2sup/.venv/bin/sup2sup"
+    audio_review_python: str = "/opt/audio-review/bin/python"
     bdrip_python: str = "/opt/crf-studio/.venv/bin/python"
     tu_ttg_token: SecretStr = SecretStr("")
     codex_bin: str = "codex"

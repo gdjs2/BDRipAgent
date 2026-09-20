@@ -353,3 +353,38 @@ def test_shortlist_can_keep_40_from_95_sparse_candidates(environment, tmp_path, 
     result = CodexScreenshotSelector().select(tmp_path)
     assert len(result["shortlisted_ids"]) == 40
     assert len(result["selected"]) == 15
+
+
+@pytest.mark.parametrize(
+    "seconds,frame,blocked", [(100, 2400, True), (129.9, 9999, True), (130, 9999, False), (900, 2400, True)]
+)
+def test_gallery_disables_same_or_nearby_cross_codec_frames(client, review_job, seconds, frame, blocked):
+    peer = client.post(
+        "/api/jobs",
+        json={"source_path": "Movie.mkv", "title": "Movie", "year": 2026, "analysis_profile": "x264-live"},
+    ).json()
+    with session() as db:
+        db.add(Screenshot(job_id=peer["id"], candidate_id=1, selected=True, info=review_candidates()[0]))
+        row = db.scalar(
+            select(Screenshot).where(Screenshot.job_id == review_job, Screenshot.candidate_id == 1)
+        )
+        row.info = {**row.info, "timeline_seconds": seconds, "source_frame_number": frame}
+        db.commit()
+    item = client.get(f"/api/jobs/{review_job}/screenshots").json()["items"][0]
+    assert bool(item["reservation"]) is blocked
+    if blocked:
+        assert item["reservation"] == {
+            "job_id": peer["id"],
+            "codec": "x264",
+            "frame_number": 2400,
+            "spacing_seconds": 30,
+        }
+        response = client.post(f"/api/jobs/{review_job}/screenshots/selection", json={"candidate_ids": [1]})
+        assert response.status_code == 409
+    # Soft deletion releases those reservations immediately.
+    with session() as db:
+        from shared.models import now
+
+        db.get(MovieJob, peer["id"]).deleted_at = now()
+        db.commit()
+    assert client.get(f"/api/jobs/{review_job}/screenshots").json()["items"][0]["reservation"] is None

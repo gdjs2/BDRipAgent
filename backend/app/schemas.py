@@ -1,3 +1,4 @@
+import unicodedata
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -6,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from backend.app.movie_metadata import normalize_imdb_id
 from shared.config import ScreenshotDecoder, ScreenshotPolicy
 from shared.encoding import EncodeTarget
+from shared.tracks import FLAG_NAMES
 
 
 class StrictModel(BaseModel):
@@ -48,6 +50,48 @@ class CreatePair(CreateJob):
 class SelectTracks(StrictModel):
     audio_track_ids: list[int]
     subtitle_track_ids: list[int]
+    track_names: dict[int, str] = Field(default_factory=dict)
+    track_flags: dict[int, dict[str, bool]] = Field(default_factory=dict)
+
+    @field_validator("track_flags", mode="before")
+    @classmethod
+    def valid_flags(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError("Track flags must map track IDs to flag choices")
+        for flags in value.values():
+            if (
+                not isinstance(flags, dict)
+                or set(flags) - set(FLAG_NAMES)
+                or any(type(v) is not bool for v in flags.values())
+            ):
+                raise ValueError("Choose only supported track flags using true or false")
+        return value
+
+    @field_validator("track_names")
+    @classmethod
+    def valid_names(cls, value):
+        names = {}
+        for track_id, name in value.items():
+            name = name.strip()
+            if (
+                track_id < 0
+                or not name
+                or len(name) > 255
+                or any(unicodedata.category(c) in ("Cc", "Cs", "Zl", "Zp") for c in name)
+            ):
+                raise ValueError(
+                    "Track names must be 1–255 characters on one line without control characters"
+                )
+            names[track_id] = name
+        return names
+
+    @model_validator(mode="after")
+    def names_for_selected_tracks(self):
+        if (self.track_names.keys() | self.track_flags.keys()) - set(
+            self.audio_track_ids + self.subtitle_track_ids
+        ):
+            raise ValueError("Custom names and flags may only be supplied for selected tracks")
+        return self
 
     @field_validator("audio_track_ids", "subtitle_track_ids")
     @classmethod
@@ -104,6 +148,7 @@ class ReleaseSource(StrictModel):
 
 
 class ReleaseDetails(ReleaseSource):
+    upload_screenshots: bool = Field(default=False, strict=True)
     chinese_name: str = Field(min_length=1, max_length=300)
     extra_description: str = Field(default="", max_length=6000)
     tracker: str = Field(min_length=1, max_length=4096)

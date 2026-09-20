@@ -106,12 +106,22 @@ database_password="$(setting POSTGRES_PASSWORD)"
 [[ "$database_password" =~ ^[a-zA-Z0-9._~-]+$ ]] || fail 'Use a URL-safe POSTGRES_PASSWORD (letters, numbers, dot, underscore, tilde or hyphen).'
 storage_root="$(setting STORAGE_ROOT)"
 storage_root="${storage_root:-./data}"
-mkdir -p -m 755 -- "$storage_root/incoming" "$storage_root/jobs" "$storage_root/completed" "$storage_root/cache/agent"
+mkdir -p -m 755 -- "$storage_root/incoming" "$storage_root/jobs" "$storage_root/completed" "$storage_root/artifacts" "$storage_root/cache/agent"
 
 printf 'Building and starting BDRip Agent. The first build may take several minutes.\n'
 if ! "${compose[@]}" up -d --build --wait --wait-timeout 180; then
   printf '\nInspect startup errors with: docker compose logs --tail=100 api worker agent postgres\n' >&2
   exit 1
+fi
+
+# Retained exports from older versions may still use the old torrent root. The
+# updated one-off worker relocates them before this empty directory is removed.
+if [[ -d "$storage_root/torrents" ]]; then
+  legacy_torrents="$(cd -- "$storage_root/torrents" && pwd)"
+  printf 'Organizing legacy releases into ART directories.\n'
+  "${compose[@]}" run --rm --no-deps -v "$legacy_torrents:/legacy-torrents" worker \
+    python -m worker.pipeline.release_migration --legacy-torrents /legacy-torrents
+  rmdir -- "$legacy_torrents" 2>/dev/null || true
 fi
 
 port="$(setting PORT)"
@@ -123,6 +133,7 @@ esac
 printf '\nDashboard: http://%s:%s\n' "$browser_host" "${port:-8080}"
 printf 'Sign in using API_TOKEN from .env (or your exported API_TOKEN override).\n'
 printf 'Incoming movies: %s/incoming\n' "$storage_root"
+printf 'Release artifacts: %s/artifacts\n' "$storage_root"
 
 if "$skip_login"; then
   printf '\nCodex login skipped. When ready: docker compose exec agent codex login --device-auth\n'

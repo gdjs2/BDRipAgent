@@ -13,6 +13,7 @@ from worker.adapters import release_runner
 from worker.adapters.release_progress import ReleaseProgressReader
 
 DETAILS = {
+    "upload_screenshots": True,
     "source": "1080p Blu-ray AVC DTS-HD MA 5.1-GROUP",
     "chinese_name": "电影中文名",
     "extra_description": "双语 · 内封字幕",
@@ -219,16 +220,28 @@ def test_worker_uses_only_selected_pairs_and_registers_outputs(
         assert [p["candidate_id"] for p in request["pairs"]] == [1]
         assert "private-upload-token" not in Path(command[-1]).read_text()
         out = Path(request["output_dir"])
-        artifact = out / "Movie.bbcode.txt"
-        artifact.write_text("fixture")
-        (out / "result.json").write_text(
-            json.dumps(
+        package = Path(request["package_dir"])
+        package.mkdir(parents=True)
+        artifacts = []
+        for suffix, kind in [
+            (".mkv", "MEDIA"),
+            (".nfo", "NFO"),
+            (".md5", "MD5"),
+            (".bbcode.txt", "BBCODE"),
+            (".torrent", "TORRENT"),
+            (".encoder-info.txt", "ENCODER_INFO"),
+        ]:
+            packaged = kind in ("MEDIA", "NFO", "MD5")
+            artifact = (package if packaged else out) / (request["release_name"] + suffix)
+            artifact.write_text("fixture")
+            artifacts.append(
                 {
-                    "artifacts": [{"path": str(artifact), "kind": "RELEASE_BBCODE", "storage": "workspace"}],
-                    "uploaded_images": 2,
+                    "path": str(artifact),
+                    "kind": "RELEASE_" + kind,
+                    "storage": "completed" if packaged else "workspace",
                 }
             )
-        )
+        (out / "result.json").write_text(json.dumps({"artifacts": artifacts, "uploaded_images": 2}))
 
     monkeypatch.setattr(TaskContext, "run", run)
     execute(task_id)
@@ -237,6 +250,15 @@ def test_worker_uses_only_selected_pairs_and_registers_outputs(
     assert job["analysis"]["release_result"]["candidate_ids"] == [1]
     assert any(a["artifact_type"] == "RELEASE_BBCODE" for a in job["artifacts"])
     assert len(requests) == 1
+    result = job["analysis"]["release_result"]
+    assert result["package_storage"] == "artifacts"
+    assert Path(result["package_path"]).name == job["release_name"]
+    assert " [ART] " in result["bundle_path"]
+    assert (environment.artifacts_root / result["package_path"]).is_dir()
+    assert (environment.artifacts_root / result["torrent_path"]).is_file()
+    for artifact in job["artifacts"]:
+        if artifact["artifact_type"].startswith("RELEASE_"):
+            assert client.get(f"/api/artifacts/{artifact['id']}").status_code == 200
 
 
 def test_runner_redacts_upload_credentials_and_tracker_errors(tmp_path, monkeypatch, capsys):
@@ -333,3 +355,25 @@ def test_legacy_retry_requires_source_before_worker_or_uploads(client, ready_rel
     )
     with pytest.raises(ValueError, match="source"):
         generate(ctx)
+
+
+def test_release_without_uploads_needs_no_token(client, ready_release, environment):
+    environment.tu_ttg_token = SecretStr("")
+    details = {**DETAILS, "upload_screenshots": False}
+    response = client.post(f"/api/jobs/{ready_release}/release", json=details)
+    assert response.status_code == 202, response.text
+    assert response.json()["analysis"]["release_details"]["upload_screenshots"] is False
+
+
+def test_release_defaults_to_no_upload_and_rejects_coerced_booleans(client, ready_release, environment):
+    environment.tu_ttg_token = SecretStr("")
+    details = {k: v for k, v in DETAILS.items() if k != "upload_screenshots"}
+    assert (
+        client.patch(
+            f"/api/jobs/{ready_release}/release", json={**details, "upload_screenshots": "false"}
+        ).status_code
+        == 422
+    )
+    response = client.post(f"/api/jobs/{ready_release}/release", json=details)
+    assert response.status_code == 202
+    assert response.json()["analysis"]["release_details"]["upload_screenshots"] is False

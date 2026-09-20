@@ -1,8 +1,8 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, readable } from "./api";
-import type { Config, Job, ReleaseDetails } from "./types";
+import type { Artifact, Config, Job, ReleaseDetails } from "./types";
 
 export function Release({
   job,
@@ -19,6 +19,7 @@ export function Release({
     extra_description: "",
     tracker: "",
     source: "",
+    upload_screenshots: false,
     ...job.analysis.release_details,
   });
   const [saved, setSaved] = useState(false);
@@ -55,7 +56,7 @@ export function Release({
       submit.reset();
     },
   });
-  function change(field: keyof ReleaseDetails, value: string) {
+  function change(field: keyof ReleaseDetails, value: string | boolean) {
     setDetails({ ...details, [field]: value });
     setSaved(false);
     submit.reset();
@@ -76,6 +77,7 @@ export function Release({
             "RELEASE_NFO",
             "RELEASE_MD5",
             "RELEASE_TORRENT",
+            "RELEASE_ENCODER_INFO",
           ].includes(a.artifact_type),
       )
     : [];
@@ -83,8 +85,8 @@ export function Release({
     <>
       <h2>Prepare your release</h2>
       <p>
-        Enter the release details, upload your chosen comparison pairs to TTG,
-        and generate the BBCode, NFO, MD5 checksum, and private torrent.
+        Generate the BBCode, NFO, MD5 checksum, and private torrent. You can
+        optionally upload your chosen comparison pairs to TTG.
       </p>
       {!available && !task && (
         <p className="muted">
@@ -171,6 +173,18 @@ export function Release({
                 HTTP, HTTPS, or UDP. Include your tracker passkey when required.
               </small>
             </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={details.upload_screenshots}
+                onChange={(e) => change("upload_screenshots", e.target.checked)}
+              />
+              Upload screenshots to TTG
+            </label>
+            <p className="muted">
+              When unchecked, no screenshots are uploaded and the BBCode
+              screenshot section stays empty.
+            </p>
             <div className="screenshot-actions">
               <button
                 type="button"
@@ -188,12 +202,16 @@ export function Release({
               <button
                 type="submit"
                 disabled={
-                  !config.release?.upload_configured || convert.isPending
+                  (details.upload_screenshots &&
+                    !config.release?.upload_configured) ||
+                  convert.isPending
                 }
               >
                 {submit.isPending
                   ? "Saving…"
-                  : "Generate files & upload screenshots"}
+                  : details.upload_screenshots
+                    ? "Generate files & upload screenshots"
+                    : "Generate files"}
               </button>
             </div>
           </fieldset>
@@ -204,18 +222,18 @@ export function Release({
             </p>
           )}
         </form>
-        {!config.release?.upload_configured && (
+        {details.upload_screenshots && !config.release?.upload_configured && (
           <p className="muted">
             Screenshot uploads need a TTG image-host API token. Set{" "}
             <code>TU_TTG_TOKEN</code> in the server’s <code>.env</code> file,
-            then restart the API and worker. You can save your release details
-            now.
+            then restart the API and worker, or uncheck uploads to generate
+            files now.
           </p>
         )}
         <p className="muted">
           Successful image uploads are saved and reused on retry. The torrent
-          contains the MKV, NFO, and MD5 files. Download the finished files
-          below.
+          contains the MKV, NFO, and MD5 files. Preview the release text and
+          download the torrent below.
         </p>
       </section>
       {controls}
@@ -242,23 +260,44 @@ export function Release({
         <section>
           <h2>Release files ready</h2>
           <p>
-            {result.uploaded_images} screenshots uploaded. Torrent pieces
-            verified against the release files.
+            {result.upload_screenshots === false
+              ? "Screenshots were not uploaded; the BBCode screenshot section is empty."
+              : `${result.uploaded_images} screenshots uploaded.`}{" "}
+            Torrent pieces verified against the release files.
           </p>
           <div className="screenshot-actions">
-            {files.map((a) => (
-              <a
-                className="button secondary"
-                href={`/api/artifacts/${a.id}`}
-                key={a.id}
-              >
-                {readable(a.artifact_type.replace("RELEASE_", ""))} ↓
-              </a>
-            ))}
+            {files
+              .filter((a) => a.artifact_type === "RELEASE_TORRENT")
+              .map((a) => (
+                <a
+                  className="button secondary"
+                  href={`/api/artifacts/${a.id}`}
+                  key={a.id}
+                >
+                  {readable(a.artifact_type.replace("RELEASE_", ""))} ↓
+                </a>
+              ))}
           </div>
+          <ReleaseTextPreview
+            key={result.task_id}
+            files={files}
+            revision={result.task_id}
+          />
           <p className="artifact-path">
-            Release folder: <code>completed/{result.package_path}</code>
+            Release folder:{" "}
+            <code>
+              {result.package_storage ?? "completed"}/
+              {result.bundle_path ?? result.package_path}
+            </code>
           </p>
+          {result.torrent_path && (
+            <p className="artifact-path">
+              Torrent:{" "}
+              <code>
+                {result.torrent_storage ?? "torrents"}/{result.torrent_path}
+              </code>
+            </p>
+          )}
           <p className="artifact-path">
             Info hash: <code>{result.infohash}</code>
           </p>
@@ -270,5 +309,75 @@ export function Release({
         </section>
       )}
     </>
+  );
+}
+
+function ReleaseTextPreview({
+  files,
+  revision,
+}: {
+  files: Artifact[];
+  revision: string;
+}) {
+  const texts = files.filter(
+    (file) => file.artifact_type !== "RELEASE_TORRENT",
+  );
+  const [selected, setSelected] = useState("");
+  const file =
+    texts.find((item) => item.id === selected) ??
+    texts.find((item) => item.artifact_type === "RELEASE_BBCODE") ??
+    texts[0];
+  const preview = useQuery({
+    queryKey: ["artifact-preview", file?.id, revision],
+    queryFn: () =>
+      api<{ filename: string; text: string; truncated: boolean }>(
+        `/artifacts/${file!.id}/preview`,
+      ),
+    enabled: Boolean(file),
+  });
+  if (!file) return null;
+  return (
+    <div className="release-text-preview">
+      <h3>Text preview</h3>
+      <div
+        className="screenshot-actions"
+        role="group"
+        aria-label="Release text files"
+      >
+        {texts.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            aria-pressed={file.id === item.id}
+            className={file.id === item.id ? "" : "secondary"}
+            onClick={() => setSelected(item.id)}
+          >
+            {item.artifact_type === "RELEASE_ENCODER_INFO"
+              ? "Encoder notes"
+              : item.artifact_type.replace("RELEASE_", "")}
+          </button>
+        ))}
+      </div>
+      {preview.isPending && <p role="status">Loading preview…</p>}
+      {preview.error && (
+        <p className="error" role="alert">
+          {preview.error.message}
+        </p>
+      )}
+      {preview.data && (
+        <>
+          <p className="artifact-path">{preview.data.filename}</p>
+          <pre tabIndex={0} aria-label={`${preview.data.filename} preview`}>
+            {preview.data.text}
+          </pre>
+          {preview.data.truncated && (
+            <p className="muted">
+              Showing the first 1 MiB.{" "}
+              <a href={`/api/artifacts/${file.id}`}>Download the full file</a>.
+            </p>
+          )}
+        </>
+      )}
+    </div>
   );
 }

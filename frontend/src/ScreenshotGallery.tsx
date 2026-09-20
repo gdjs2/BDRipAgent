@@ -45,7 +45,7 @@ export function ScreenshotGallery({
     view === "best" ? best : view === "shortlist" ? shortlist : final;
   const chosen = (
     draft ?? best.filter((s) => s.selected).map((s) => s.candidate_id)
-  ).filter((id) => best.some((s) => s.candidate_id === id));
+  ).filter((id) => best.some((s) => s.candidate_id === id && !s.reservation));
   const canEdit = [
     "WAITING_FOR_SCREENSHOT_SELECTION",
     "WAITING_FOR_RELEASE_DETAILS",
@@ -61,6 +61,7 @@ export function ScreenshotGallery({
       api<Job>(`/jobs/${job.id}/screenshots/selection`, {
         candidate_ids: chosen,
       }),
+    onSettled: () => query.invalidateQueries({ queryKey: ["screenshots"] }),
     onSuccess: (updated) => {
       query.setQueryData(["job", job.id], updated);
       query.invalidateQueries({ queryKey: ["screenshots", job.id] });
@@ -123,7 +124,9 @@ export function ScreenshotGallery({
       <p>
         Keep up to 15 best choices, remove any you do not want, or add
         replacements from the full shortlist. Choose 1–15 final pairs. Both
-        images in every pair must be B-frames.
+        images in every pair must be B-frames. Frames reserved by the other
+        codec, including nearby frames within the required spacing, cannot be
+        selected.
       </p>
       {controls}
       {job.state === "WAITING_FOR_RELEASE_DETAILS" && (
@@ -196,11 +199,13 @@ export function ScreenshotGallery({
               className="secondary"
               disabled={editing}
               onClick={() => {
-                setDraft(best.map((s) => s.candidate_id));
+                setDraft(
+                  best.filter((s) => !s.reservation).map((s) => s.candidate_id),
+                );
                 choose.reset();
               }}
             >
-              Choose all {best.length}
+              Choose all available
             </button>
             <button
               className="secondary"
@@ -286,6 +291,13 @@ export function ScreenshotGallery({
                 <p>{shot.info.reason ?? "Source shortlist candidate"}</p>
               </div>
             </button>
+            {shot.reservation && (
+              <p className="muted" role="status">
+                Reserved by {shot.reservation.codec}: frame{" "}
+                {shot.reservation.frame_number}. Keep at least{" "}
+                {shot.reservation.spacing_seconds} seconds apart.
+              </p>
+            )}
             {canEdit && view !== "final" && (
               <div className="screenshot-curation">
                 {shot.info.recommendation_rank ? (
@@ -300,7 +312,9 @@ export function ScreenshotGallery({
                 ) : (
                   <button
                     className="secondary"
-                    disabled={editing || best.length >= 15}
+                    disabled={
+                      editing || best.length >= 15 || Boolean(shot.reservation)
+                    }
                     aria-label={`Add candidate ${shot.candidate_id} to best`}
                     onClick={() => editBest(shot.candidate_id, true)}
                   >
@@ -317,7 +331,7 @@ export function ScreenshotGallery({
                   type="checkbox"
                   aria-label={`Choose candidate ${shot.candidate_id}`}
                   checked={chosen.includes(shot.candidate_id)}
-                  disabled={editing}
+                  disabled={editing || Boolean(shot.reservation)}
                   onChange={() => toggle(shot.candidate_id)}
                 />
                 Choose this pair
@@ -395,7 +409,7 @@ export function ScreenshotGallery({
                   type="checkbox"
                   aria-label={`Choose candidate ${open.candidate_id} in preview`}
                   checked={chosen.includes(open.candidate_id)}
-                  disabled={editing}
+                  disabled={editing || Boolean(open.reservation)}
                   onChange={() => toggle(open.candidate_id)}
                 />
                 Choose this pair

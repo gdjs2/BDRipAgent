@@ -162,3 +162,5 @@ def test_smoke_frame_choices_do_not_reserve_frames_for_real_jobs(client, environ
         first.analysis = {}
         second.analysis = {"smoke_test": True}
         assert other_variant_frames(db, second) == []
+        first.analysis = {"smoke_test": True}
+        assert len(other_variant_frames(db, second)) == 1

@@ -1,91 +1,38 @@
 import json
 import math
-import os
-import signal
-import subprocess
-import tempfile
 from pathlib import Path
+from uuid import uuid4
 
+from agent.codex_stream import invoke
 from agent.schemas import Selection, review_policy, validate_selection
-from shared.config import ScreenshotPolicy, behavior, get_settings
+from shared.config import ScreenshotPolicy, behavior
 from shared.paths import contained
 
 
 class CodexScreenshotSelector:
-    """Python adapter around the documented Codex noninteractive CLI."""
+    """Screenshot selection with streamed Codex app-server responses."""
+
+    def __init__(self, on_event=None, check=None):
+        self.on_event = on_event or (lambda event: None)
+        self.check = check or (lambda: None)
+        self.stage = "shortlist"
 
     def _invoke(self, prompt, images):
-        settings = get_settings()
-        with tempfile.TemporaryDirectory(prefix="screenshot-agent-") as temporary:
-            directory = Path(temporary)
-            schema = directory / "schema.json"
-            output = directory / "decision.json"
-            schema.write_text(json.dumps(Selection.model_json_schema()))
-            command = [
-                settings.codex_bin,
-                "exec",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--ignore-user-config",
-                "--ignore-rules",
-                "--json",
-                "--color",
-                "never",
-                "--output-schema",
-                str(schema),
-                "--output-last-message",
-                str(output),
-                "-C",
-                temporary,
-                "-c",
-                'approval_policy="never"',
-                "-c",
-                'web_search="disabled"',
-                "-c",
-                "features.shell_tool=false",
-                "-c",
-                "features.unified_exec=false",
-            ]
-            model = behavior()["agent"].get("model")
-            if model:
-                command += ["--model", model]
-            for image in images:
-                command += ["--image", str(image)]
-            command += ["-"]
-            # No API/database/service credentials are inherited by the reasoning subprocess.
-            env = {
-                k: v
-                for k, v in os.environ.items()
-                if k in ["PATH", "HOME", "CODEX_HOME", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR"]
-            }
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = process.communicate(prompt, timeout=behavior()["agent"]["timeout_seconds"])
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
-                raise TimeoutError("Codex screenshot selection timed out") from None
-            if process.returncode:
-                raise RuntimeError(f"Codex selection failed (exit {process.returncode}): {stderr[-3000:]}")
-            thread = None
-            for line in stdout.splitlines():
-                try:
-                    item = json.loads(line)
-                    if item.get("type") == "thread.started":
-                        thread = item.get("thread_id")
-                except ValueError:
-                    continue
-            return Selection.model_validate_json(output.read_text()), thread
+        invocation_id = str(uuid4())
+
+        def emit(event):
+            self.check()
+            self.on_event({**event, "invocation_id": invocation_id, "stage": self.stage})
+
+        emit({"type": "prompt", "text": prompt, "images": [image.name for image in images]})
+        try:
+            text, thread = invoke(prompt, images, Selection.model_json_schema(), emit, self.check)
+            selection = Selection.model_validate_json(text)
+            emit({"type": "complete", "text": "Response received"})
+            return selection, thread
+        except Exception as error:
+            emit({"type": "error", "text": str(error)})
+            raise
 
     def select(self, root: Path):
         inventory = json.loads(contained(root, "inventory.json", exists=True).read_text())
@@ -138,6 +85,7 @@ class CodexScreenshotSelector:
         )
         final_prompt += json.dumps([c["candidate_id"] for c in short])
         errors = []
+        self.stage = "review"
         for attempt in range(behavior()["agent"]["selection_attempts"]):
             decision, thread = self._invoke(
                 final_prompt + "\nRequired corrections: " + json.dumps(errors), images

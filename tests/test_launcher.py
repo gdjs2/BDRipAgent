@@ -48,6 +48,10 @@ if 'config' in args:
 elif 'up' in args:
     assert '--wait' in args and '--build' in args
     sys.exit(int(os.environ.get('FAKE_UP_ERROR', '0')))
+elif 'run' in args:
+    assert args[-4:] == ['-m', 'worker.pipeline.release_migration', '--legacy-torrents', '/legacy-torrents']
+    assert '--no-deps' in args and '--rm' in args
+    sys.exit(int(os.environ.get('FAKE_MIGRATION_ERROR', '0')))
 elif 'exec' in args:
     if args[-2:] == ['login', 'status']:
         sys.exit(0 if os.environ.get('FAKE_LOGGED_IN') else 1)
@@ -172,3 +176,19 @@ def test_gpu_start_adds_optional_compose_override(launcher, arguments):
     files = [startup[i + 1] for i, arg in enumerate(startup) if arg == "-f"]
     assert files == [str(project / "docker-compose.yml"), str(project / "docker-compose.gpu.yml")]
     assert not list(project.glob(".env.startup.*"))
+
+
+def test_startup_relocates_legacy_exports_and_removes_only_empty_torrent_directory(launcher):
+    project, run, log = launcher
+    torrents = project / "data" / "torrents"
+    torrents.mkdir(parents=True)
+    result = run("--no-login")
+    assert result.returncode == 0, result.stderr
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    migration = next(command for command in commands if "run" in command)
+    assert str(torrents) + ":/legacy-torrents" in migration
+    assert not torrents.exists()
+    torrents.mkdir()
+    (torrents / "unrelated.txt").write_text("keep")
+    assert run("--no-login").returncode == 0
+    assert (torrents / "unrelated.txt").read_text() == "keep"

@@ -14,6 +14,7 @@ from shared.models import Task
 from shared.paths import contained, job_dir, write_json
 from shared.release import selected_pairs
 from worker.adapters.release_progress import ReleaseProgressReader
+from worker.pipeline.release_exports import publish, release_paths, validate_name
 
 
 def generate(ctx):
@@ -22,6 +23,7 @@ def generate(ctx):
     # A retry must fail before file generation or uploads if this field is absent.
     source = ReleaseSource(source=details.get("source", "")).source
     details = {**details, "source": source}
+    validate_name(ctx.job.release_name)
     ctx.source()
     with session() as db:
         pairs = selected_pairs(db, ctx.job, ctx.settings)
@@ -51,6 +53,7 @@ def generate(ctx):
         {
             "details": details,
             "title": ctx.job.title,
+            "release_name": ctx.job.release_name,
             "year": ctx.job.year,
             "imdb_id": ctx.job.imdb_id,
             "smoke_test": is_smoke_test(ctx.job),
@@ -76,7 +79,9 @@ def generate(ctx):
     )
     result = json.loads(output.read_text())
     artifacts = []
-    for item in result.pop("artifacts"):
+    ctx.progress(99, phase="Preparing release ART directory")
+    exported = publish(ctx, result.pop("artifacts"))
+    for item in exported:
         # The bridge runs locally; paths still must belong to configured storage.
         relative = ctx.artifact(
             Path(item["path"]),
@@ -86,7 +91,7 @@ def generate(ctx):
         )
         artifacts.append({"path": relative, "kind": item["kind"], "storage": item["storage"]})
     result["artifacts"] = artifacts
-    result["package_path"] = str(package.relative_to(ctx.settings.completed_root))
+    result.update(release_paths(exported, ctx.settings.artifacts_root))
     result["candidate_ids"] = [p["candidate_id"] for p in pairs]
     result["details"] = details
     result["task_id"] = ctx.task_id

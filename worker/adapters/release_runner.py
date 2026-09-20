@@ -97,7 +97,8 @@ def run(request, token):
     if not isinstance(source, str) or not source.strip() or any(ord(c) < 32 or ord(c) == 127 for c in source):
         raise ValueError("Enter a single-line Source in the Release form before generating files")
     source = source.strip()
-    if not token.strip():
+    upload_enabled = details.get("upload_screenshots", True)
+    if upload_enabled and not token.strip():
         raise ValueError("TU_TTG_TOKEN is required for screenshot uploads")
     output = Path(request["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
@@ -107,7 +108,8 @@ def run(request, token):
     original = movie.stat()
     package = Path(request["package_dir"])
     package.mkdir(parents=True, exist_ok=True)
-    distribution_movie = package / movie.name
+    release_name = request.get("release_name", movie.stem)
+    distribution_movie = package / f"{release_name}.mkv"
     if not distribution_movie.exists():
         # Both paths live under COMPLETED_ROOT; large movies need no second copy.
         try:
@@ -159,48 +161,54 @@ def run(request, token):
             target = comparison / name
             if not target.exists():
                 shutil.copyfile(pair[kind], target)
-    cache_path = cache_dir / "uploads.json"
-    uploads = json.loads(cache_path.read_text()) if cache_path.is_file() else {}
-    # Retry every missing image, including unvisited images after an interruption.
-    uploads.pop("failed_screenshot_uploads", None)
-    cached = screenshots.cached_screenshot_urls(uploads, comparison.parent)
     total = len(request["pairs"]) * 2
-    done = len(cached.get("Comparison", {}))
-    progress.report(
-        10 + 40 * done / total, "Uploading selected screenshot pairs", uploaded=done, total_images=total
-    )
-
-    def upload_event(event, path, attempt, attempts, error):
-        nonlocal done
-        if event == "success":
-            done += 1
+    # A nonempty section map with empty contents keeps the upstream comparison
+    # heading but suppresses every image, including URLs cached by earlier runs.
+    uploaded = {"Comparison": {}, "More": {}}
+    if upload_enabled:
+        cache_path = cache_dir / "uploads.json"
+        uploads = json.loads(cache_path.read_text()) if cache_path.is_file() else {}
+        # Retry every missing image, including unvisited images after an interruption.
+        uploads.pop("failed_screenshot_uploads", None)
+        cached = screenshots.cached_screenshot_urls(uploads, comparison.parent)
+        done = len(cached.get("Comparison", {}))
         progress.report(
-            10 + 40 * done / total,
-            "Uploading selected screenshot pairs",
-            uploaded=done,
-            total_images=total,
-            image=path.name,
-            attempt=attempt,
+            10 + 40 * done / total, "Uploading selected screenshot pairs", uploaded=done, total_images=total
         )
-        print(f"Screenshot {path.name}: {event} (attempt {attempt}/{attempts})", flush=True)
 
-    uploaded, failures = screenshots.upload_screenshots_cached(
-        uploads,
-        cache_path,
-        comparison.parent,
-        f"{screenshots.remote_release_folder(movie)}/{request['remote_suffix']}",
-        token,
-        event_callback=upload_event,
-        verbose=False,
-    )
-    if failures or len(uploaded.get("Comparison", {})) != total:
-        raise RuntimeError("Some screenshot uploads failed. Retry this stage to resume the missing images.")
+        def upload_event(event, path, attempt, attempts, error):
+            nonlocal done
+            if event == "success":
+                done += 1
+            progress.report(
+                10 + 40 * done / total,
+                "Uploading selected screenshot pairs",
+                uploaded=done,
+                total_images=total,
+                image=path.name,
+                attempt=attempt,
+            )
+            print(f"Screenshot {path.name}: {event} (attempt {attempt}/{attempts})", flush=True)
+
+        uploaded, failures = screenshots.upload_screenshots_cached(
+            uploads,
+            cache_path,
+            comparison.parent,
+            f"{screenshots.remote_release_folder(movie)}/{request['remote_suffix']}",
+            token,
+            event_callback=upload_event,
+            verbose=False,
+        )
+        if failures or len(uploaded.get("Comparison", {})) != total:
+            raise RuntimeError(
+                "Some screenshot uploads failed. Retry this stage to resume the missing images."
+            )
     config = {
         "file_path": str(distribution_movie),
         "screenshots_dir": str(comparison.parent),
         "imdb_id": request.get("imdb_id") or "unavailable",
         "movie_name": request["title"],
-        "english_name": movie.stem.replace(".", " "),
+        "english_name": release_name.replace(".", " "),
         **details,
         "encoder": encoder,
         "source": source,
@@ -216,12 +224,12 @@ def run(request, token):
         post = bbcode.render(config, output, uploaded)
     finally:
         bbcode.imdb_metadata = lookup
-    bbcode_path = output / f"{movie.stem}.bbcode.txt"
+    bbcode_path = output / f"{release_name}.bbcode.txt"
     bbcode_path.write_text(post.replace("[img][/img]\n\n", ""), encoding="utf-8")
     nfo_metadata = {
         **technical,
         **info,
-        "file_name": movie.stem,
+        "file_name": release_name,
         "encoded_by": encoder,
         "imdb": info["imdb_url"],
         "source": source,
@@ -231,14 +239,14 @@ def run(request, token):
         "framerate": technical["frame_rate"],
         "resolution": f"{technical['resolution']} ({technical['aspect_ratio']})",
     }
-    nfo_path = package / f"{movie.stem}.nfo"
+    nfo_path = package / f"{release_name}.nfo"
     nfo_path.write_bytes(nfo.render_nfo(nfo_metadata, "cp437"))
     progress.report(58, "Calculating movie MD5")
     checksum = md5_file(distribution_movie)
-    md5_path = package / f"{movie.stem}.md5"
-    md5_path.write_text(f"{checksum}  {movie.name}\n", encoding="ascii")
+    md5_path = package / f"{release_name}.md5"
+    md5_path.write_text(f"{checksum}  {distribution_movie.name}\n", encoding="ascii")
     progress.report(72, "Hashing torrent pieces")
-    torrent_path = output / f"{movie.stem}.torrent"
+    torrent_path = output / f"{release_name}.torrent"
     infohash = create_private_torrent(
         {"torrent": {"tracker": details["tracker"], "verify": True}},
         package,
@@ -251,13 +259,14 @@ def run(request, token):
     result = {
         "infohash": infohash,
         "md5": checksum,
-        "uploaded_images": total,
+        "uploaded_images": total if upload_enabled else 0,
+        "upload_screenshots": upload_enabled,
         "upload_host": "TTG",
         "smoke_test": smoke,
         "warnings": warnings,
         "screenshots": [
             {"filename": p.name, "url": full, "thumbnail_url": thumb}
-            for p, (full, thumb) in sorted(uploaded["Comparison"].items())
+            for p, (full, thumb) in sorted(uploaded.get("Comparison", {}).items())
         ],
         "artifacts": [
             {"path": str(path), "kind": kind, "storage": storage}
@@ -272,7 +281,7 @@ def run(request, token):
         ],
     }
     write_json(output / "result.json", result)
-    progress.report(100, "Release files ready", uploaded=total, total_images=total)
+    progress.report(100, "Release files ready", uploaded=total if upload_enabled else 0, total_images=total)
     return result
 
 
