@@ -1,0 +1,12 @@
+# Opt-in NVIDIA access; the default Compose file also works on CPU-only hosts.
+services:
+  worker:
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,133 @@
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://movie:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres/movie
+  REDIS_URL: redis://redis:6379/0
+  SOURCE_ROOT: /source
+  WORKSPACE_ROOT: /workspace
+  COMPLETED_ROOT: /completed
+  CACHE_ROOT: /cache
+  API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env}
+  AGENT_TOKEN: ${AGENT_TOKEN:?Set AGENT_TOKEN in .env}
+  WORKER_CAPACITY: ${WORKER_CAPACITY:-8}
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - '${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:80'
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      <<: *app-env
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      IMDB_TIMEOUT_SECONDS: ${IMDB_TIMEOUT_SECONDS:-25}
+      TU_TTG_TOKEN: ${TU_TTG_TOKEN:-}
+    volumes:
+      - ${STORAGE_ROOT:-./data}/incoming:/source:ro
+      - ${STORAGE_ROOT:-./data}/jobs:/workspace
+      - ${STORAGE_ROOT:-./data}/completed:/completed:ro
+      - ./config:/app/config:ro
+      - ./profiles:/app/profiles:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', '/app/.venv/bin/python', '-c', "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    init: true
+    command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--autoscale=${WORKER_CAPACITY:-8},1']
+    environment:
+      <<: *app-env
+      AGENT_URL: http://agent:8001
+      TU_TTG_TOKEN: ${TU_TTG_TOKEN:-}
+    volumes:
+      - ${STORAGE_ROOT:-./data}/incoming:/source:ro
+      - ${STORAGE_ROOT:-./data}/jobs:/workspace
+      - ${STORAGE_ROOT:-./data}/completed:/completed
+      - ${STORAGE_ROOT:-./data}/cache:/cache
+      - ./config:/app/config:ro
+      - ./profiles:/app/profiles:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      agent:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:-0.155.1}
+    init: true
+    environment:
+      AGENT_TOKEN: ${AGENT_TOKEN:?Set AGENT_TOKEN in .env}
+      CACHE_ROOT: /cache
+      CODEX_HOME: /auth
+    volumes:
+      - codex-auth:/auth
+      # Only source-derived candidate images are visible to the agent.
+      - ${STORAGE_ROOT:-./data}/cache/agent:/cache/agent:ro
+      - ./config:/app/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ['CMD', '/app/.venv/bin/python', '-c', "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: movie
+      POSTGRES_USER: movie
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U movie -d movie']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, 'yes']
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  codex-auth:

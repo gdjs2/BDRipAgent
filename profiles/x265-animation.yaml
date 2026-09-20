@@ -1,0 +1,11 @@
+codec: x265
+encoder: x265_10bit
+preset: slow
+tune: animation
+extra_options: ''
+bit_depth: 10
+crf_min: 0
+crf_max: 51
+
+video_profile: main10
+level: null

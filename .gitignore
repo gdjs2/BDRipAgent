@@ -1,0 +1,92 @@
+# Python bytecode, packages, and virtual environments
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.venv-*
+venv/
+
+# Private environment files; keep only documented configuration templates
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+
+# Credentials, private keys, and local authentication state
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+auth.json
+credentials.json
+client_secret*.json
+secrets/
+.secrets/
+credentials/
+.credentials/
+.ssh/
+.gnupg/
+.aws/
+.azure/
+.gcloud/
+
+# Local development settings and tool caches
+.agents/
+.codex/
+.idea/
+.vscode/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+
+# Frontend dependencies and generated TypeScript/Vite output
+node_modules/
+*.tsbuildinfo
+.vite/
+
+# Runtime media, job data, databases, logs, and release outputs
+data/
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal
+*.log
+logs/
+*.mkv
+*.mp4
+*.m2ts
+*.iso
+*.torrent
+
+# Editor/OS temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+*.tmp
+*.temp
+*~
+
+# Third-party tool checkouts are installed at pinned revisions by Docker
+vendor/*
+!vendor/README.md

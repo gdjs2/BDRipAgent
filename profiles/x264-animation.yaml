@@ -1,0 +1,11 @@
+codec: x264
+encoder: x264
+preset: slow
+tune: animation
+extra_options: ''
+bit_depth: 8
+crf_min: 0
+crf_max: 51
+
+video_profile: high
+level: null

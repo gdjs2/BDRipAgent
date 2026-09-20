@@ -1,0 +1,151 @@
+from urllib.parse import urlsplit
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+
+from backend.app.movie_metadata import normalize_imdb_id
+from shared.config import ScreenshotDecoder, ScreenshotPolicy
+from shared.encoding import EncodeTarget
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class CreateJob(StrictModel):
+    source_path: str
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    year: int | None = Field(default=None, ge=1880, le=2200)
+    imdb_id: str | None = None
+    analysis_profile: str = "x265-live"
+    screenshot_policy: ScreenshotPolicy | None = None
+
+    @field_validator("title")
+    @classmethod
+    def printable(cls, value):
+        if value is None:
+            return value
+        if not value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError("Text must be nonempty and contain no control characters")
+        return value.strip()
+
+    @field_validator("imdb_id")
+    @classmethod
+    def valid_imdb_id(cls, value):
+        return normalize_imdb_id(value) if value and value.strip() else None
+
+    @model_validator(mode="after")
+    def identity_required(self):
+        if not self.imdb_id and (self.title is None or self.year is None):
+            raise ValueError("Provide an IMDb ID, or enter both the movie title and release year")
+        return self
+
+
+class CreatePair(CreateJob):
+    second_profile: str = "x264-live"
+
+
+class SelectTracks(StrictModel):
+    audio_track_ids: list[int]
+    subtitle_track_ids: list[int]
+
+    @field_validator("audio_track_ids", "subtitle_track_ids")
+    @classmethod
+    def unique_ids(cls, value):
+        if len(value) != len(set(value)) or any(x < 0 for x in value):
+            raise ValueError("Track IDs must be unique nonnegative integers")
+        return value
+
+
+class SelectEncode(EncodeTarget):
+    codec: str
+    profile: str
+
+
+class Login(StrictModel):
+    token: str
+
+
+class ReplaceScreenshot(StrictModel):
+    candidate_id: int
+
+
+class SelectScreenshotDecoder(StrictModel):
+    decoder: ScreenshotDecoder
+
+
+class SelectScreenshots(StrictModel):
+    candidate_ids: list[StrictInt] = Field(min_length=1, max_length=15)
+
+    @field_validator("candidate_ids")
+    @classmethod
+    def unique_candidates(cls, value):
+        if len(value) != len(set(value)) or any(candidate < 1 for candidate in value):
+            raise ValueError("Choose unique positive candidate IDs")
+        return value
+
+
+class CurateScreenshots(SelectScreenshots):
+    candidate_ids: list[StrictInt] = Field(max_length=15)
+
+
+class ReleaseSource(StrictModel):
+    source: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("source")
+    @classmethod
+    def source_text(cls, value):
+        if any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("Source must be a single line without control characters")
+        value = value.strip()
+        if not value:
+            raise ValueError("Source is required")
+        return value
+
+
+class ReleaseDetails(ReleaseSource):
+    chinese_name: str = Field(min_length=1, max_length=300)
+    extra_description: str = Field(default="", max_length=6000)
+    tracker: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("chinese_name", "extra_description", "tracker")
+    @classmethod
+    def clean_text(cls, value, info):
+        value = value.strip()
+        if any(ord(c) < 32 and c not in "\n\t" for c in value):
+            raise ValueError("Text contains unsupported control characters")
+        if info.field_name != "extra_description" and not value:
+            raise ValueError("This field is required")
+        return value
+
+    @field_validator("tracker")
+    @classmethod
+    def tracker_url(cls, value):
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in ("https", "http", "udp") or not parsed.hostname:
+            raise ValueError("Tracker must be an absolute HTTP, HTTPS, or UDP announce URL")
+        if any(c.isspace() for c in value) or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("Tracker must not contain whitespace, fragments, or user credentials")
+        if parsed.port is not None and parsed.port < 1:
+            raise ValueError("Invalid tracker port")
+        return value
+
+
+class UpdateQueue(StrictModel):
+    max_concurrent_jobs: int | None = Field(default=None, ge=1, le=64, strict=True)
+    paused: bool | None = Field(default=None, strict=True)
+
+
+class HoldTask(StrictModel):
+    held: bool = Field(strict=True)
+
+
+class OrderQueue(StrictModel):
+    task_ids: list[UUID]
+
+    @field_validator("task_ids")
+    @classmethod
+    def unique_tasks(cls, value):
+        if len(value) != len(set(value)):
+            raise ValueError("Queue task IDs must be unique")
+        return value

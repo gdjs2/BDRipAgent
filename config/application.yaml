@@ -1,0 +1,52 @@
+task_lease_seconds: 120
+command_timeout_seconds: 259200
+candidate_count: 100
+candidate_sample_seconds: 0.5
+candidate_window_seconds: 3.0
+candidate_attempts_per_bucket: 4
+scene_histogram_threshold: 0.30
+black_threshold: 8
+white_threshold: 247
+minimum_contrast: 8
+minimum_blur_score: 15
+duplicate_hash_distance: 5
+screenshots:
+  decoder: cuda
+  count: 7
+  representative: 4
+  encode_challenging: 3
+  min_spacing_seconds: 30
+  min_timeline_bins: 3
+  max_per_scene: 1
+  policy: >-
+    Focus on characters, using faces, hair, skin, clothing, grain and dark shadow
+    detail to demonstrate encoding quality. At least five of seven frames must
+    visibly feature characters. Avoid credits, title cards,
+    transitions, fades, motion blur and repeated scenes. Cover the movie's timeline.
+screenshot_overlay:
+  font_paths:
+    - /usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf
+    - /usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf
+    - /usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf
+    - /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+  font_size: 16
+  letter_spacing: -0.2
+  baseline_offset: 12
+  x: 8
+  y: 3
+  line_pitch: 18
+  text_color: '#FFFF00'
+  outline_color: '#000000'
+  outline_width: 1
+integrations:
+  crf_studio:
+    count: 10
+    seconds: 10.0
+    seed: 0
+  sup2sup:
+    fit: margin
+    margin: 20
+agent:
+  model: null
+  timeout_seconds: 900
+  selection_attempts: 3

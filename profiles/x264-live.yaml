@@ -1,0 +1,11 @@
+codec: x264
+encoder: x264
+preset: placebo
+tune: null
+extra_options: 'deblock=-3,-3:bframes=10:rc-lookahead=60:aq-strength=0.80:me=umh:merange=64:psy-rd=1.05,0.05:vbv-bufsize=30000:vbv-maxrate=40000'
+bit_depth: 8
+crf_min: 13
+crf_max: 20
+
+video_profile: high
+level: 4.1
