@@ -3,9 +3,9 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from worker.adapters.audio_transcribe import transcribe
 
 from worker.adapters import audio_review
-from worker.adapters.audio_transcribe import transcribe
 from worker.runtime import Interrupted, ToolError
 
 
@@ -112,3 +112,41 @@ def test_local_transcriber_preserves_timestamps_confidence_and_containment(tmp_p
     (tmp_path.parent / "outside.wav").touch()
     with pytest.raises(ValueError, match="outside"):
         transcribe(inventory, SimpleNamespace(transcribe=infer), lambda *a, **kw: None)
+
+
+def test_silence_and_identical_pcm_do_not_repeat_speech_inference(tmp_path):
+    for name in ("one.wav", "two.wav", "silent.wav"):
+        (tmp_path / name).touch()
+    calls = []
+
+    def infer(path, **kwargs):
+        calls.append(path)
+        return iter([]), SimpleNamespace(language="en", language_probability=0.9)
+
+    inventory = {
+        "workspace": str(tmp_path),
+        "tracks": {
+            "1": {
+                "samples": [
+                    {"id": 1, "path": "one.wav", "pcm_sha256": "same"},
+                    {"id": 2, "path": "two.wav", "pcm_sha256": "same"},
+                    {"id": 3, "path": "silent.wav", "silent": True},
+                ]
+            }
+        },
+    }
+    result = transcribe(inventory, SimpleNamespace(transcribe=infer), lambda *a, **kw: None)
+    assert len(calls) == 1
+    assert result["1"]["1"] == result["1"]["2"]
+    assert result["1"]["3"]["speech_skipped"] == "silent"
+
+
+def test_native_audio_sampling_keeps_original_track_offset(tmp_path):
+    path = tmp_path / "offset.txt"
+    path.write_text("# timestamp format v2\n1500.000\n1520.000\n")
+    ctx = SimpleNamespace(workspace=tmp_path)
+    assert audio_review.native_start_seconds(ctx, {"source_timestamps_path": path.name}) == 1.5
+    assert audio_review.native_start_seconds(ctx, {"start_time": 0.25}) == 0.25
+    path.write_text("# timestamp format v2\nnan\n")
+    with pytest.raises(ValueError, match="Invalid audio timestamp"):
+        audio_review.native_start_seconds(ctx, {"source_timestamps_path": path.name})

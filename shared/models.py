@@ -82,12 +82,29 @@ class TrackSelection(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class SourceTrackChoices(Base):
+    __tablename__ = "source_track_choices"
+    source_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    data: Mapped[dict] = mapped_column(DATA)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class SourceReleaseDetails(Base):
+    __tablename__ = "source_release_details"
+    source_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    data: Mapped[dict] = mapped_column(DATA)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
         Index(
-            "one_active_task_per_job",
+            "one_active_task_per_lane",
             "job_id",
+            "lane",
             unique=True,
             postgresql_where=text("status IN ('QUEUED','RUNNING')"),
             sqlite_where=text("status IN ('QUEUED','RUNNING')"),
@@ -95,6 +112,7 @@ class Task(Base):
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     job_id: Mapped[str] = mapped_column(ForeignKey("movie_jobs.id"), index=True)
+    lane: Mapped[str] = mapped_column(String(20), default="pipeline", server_default="pipeline")
     type: Mapped[str] = mapped_column(String(60))
     stage: Mapped[str] = mapped_column(String(60))
     status: Mapped[str] = mapped_column(String(20), default="QUEUED", index=True)
@@ -125,10 +143,14 @@ class QueueSettings(Base):
     __tablename__ = "queue_settings"
     __table_args__ = (
         CheckConstraint("id = 1", name="queue_singleton"),
-        CheckConstraint("max_concurrent_jobs BETWEEN 1 AND 64", name="queue_limit_bounds"),
+        CheckConstraint("max_encoding_tasks BETWEEN 1 AND 64", name="queue_encoding_limit_bounds"),
+        CheckConstraint("max_crf_tasks BETWEEN 1 AND 64", name="queue_crf_limit_bounds"),
+        CheckConstraint("max_other_tasks BETWEEN 1 AND 64", name="queue_other_limit_bounds"),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    max_concurrent_jobs: Mapped[int] = mapped_column(Integer, default=1)
+    max_encoding_tasks: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    max_crf_tasks: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    max_other_tasks: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
 
 

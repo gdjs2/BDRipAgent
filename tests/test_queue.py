@@ -27,12 +27,17 @@ def more_jobs(client, new_job):
 
 def test_queue_settings_are_persistent_and_authenticated(client):
     value = client.get("/api/queue").json()
-    assert value["max_concurrent_jobs"] == 1 and not value["paused"]
-    assert client.patch("/api/queue", json={"max_concurrent_jobs": 2, "paused": True}).status_code == 200
+    assert (
+        value["max_encoding_tasks"] == 1
+        and value["max_crf_tasks"] == 1
+        and value["max_other_tasks"] == 3
+        and not value["paused"]
+    )
+    assert client.patch("/api/queue", json={"max_other_tasks": 2, "paused": True}).status_code == 200
     value = client.get("/api/queue").json()
-    assert value["effective_limit"] == 2 and value["paused"]
+    assert value["effective_other_limit"] == 2 and value["paused"]
     with session() as db:
-        assert queue.settings(db).max_concurrent_jobs == 2
+        assert queue.settings(db).max_other_tasks == 2
     client.headers.clear()
     assert client.get("/api/queue").status_code == 401
     assert client.patch("/api/queue", json={"paused": False}).status_code == 401
@@ -40,12 +45,12 @@ def test_queue_settings_are_persistent_and_authenticated(client):
 
 @pytest.mark.parametrize("value", [0, 65, True, 1.5, "2"])
 def test_queue_rejects_invalid_limits(client, value):
-    assert client.patch("/api/queue", json={"max_concurrent_jobs": value}).status_code == 422
+    assert client.patch("/api/queue", json={"max_other_tasks": value}).status_code == 422
 
 
 def test_queue_limit_cannot_exceed_worker_capacity(client, environment):
     assert (
-        client.patch("/api/queue", json={"max_concurrent_jobs": environment.worker_capacity + 1}).status_code
+        client.patch("/api/queue", json={"max_other_tasks": environment.worker_capacity + 1}).status_code
         == 409
     )
 
@@ -57,7 +62,7 @@ def test_dispatch_obeys_pause_hold_order_capacity_and_delivery_reservations(clie
     ids = [j["tasks"][0]["id"] for j in jobs]
     sent = []
     monkeypatch.setattr(execute, "apply_async", lambda **kwargs: sent.append(kwargs["args"][0]))
-    client.patch("/api/queue", json={"paused": True, "max_concurrent_jobs": 2})
+    client.patch("/api/queue", json={"paused": True, "max_other_tasks": 2})
     dispatch()
     assert not sent
     assert client.put("/api/queue/order", json={"task_ids": ids[::-1]}).status_code == 200
@@ -98,11 +103,16 @@ def test_worker_admission_limits_concurrency_and_defers_stale_broker_messages(cl
             both_started.set()
         assert release.wait(15)
 
+    def queue_only_advance(db, job):
+        job.state = "WAITING_FOR_ENCODE_SELECTION"
+
+    monkeypatch.setattr("worker.tasks.advance", queue_only_advance)
     monkeypatch.setitem(HANDLERS, "analyze", handler)
+    client.patch("/api/queue", json={"max_other_tasks": 1})
     # Direct delivery cannot jump ahead of the FIFO queue.
     execute(ids[2])
     assert not calls
-    client.patch("/api/queue", json={"max_concurrent_jobs": 2})
+    client.patch("/api/queue", json={"max_other_tasks": 2})
     threads = [threading.Thread(target=execute, args=(task_id,)) for task_id in ids[:2]]
     try:
         for thread in threads:
@@ -111,7 +121,7 @@ def test_worker_admission_limits_concurrency_and_defers_stale_broker_messages(cl
         execute(ids[2])
         assert set(calls) == set(ids[:2])
         assert len(client.get("/api/queue").json()["running"]) == 2
-        client.patch("/api/queue", json={"max_concurrent_jobs": 1, "paused": True})
+        client.patch("/api/queue", json={"max_other_tasks": 1, "paused": True})
         assert len(client.get("/api/queue").json()["running"]) == 2
         assert client.patch(f"/api/queue/tasks/{ids[0]}", json={"held": True}).status_code == 409
     finally:
@@ -126,7 +136,7 @@ def test_worker_admission_limits_concurrency_and_defers_stale_broker_messages(cl
     execute(ids[2])  # Duplicate delivery cannot repeat successful work.
     assert len(calls) == 3
     assert not client.get("/api/queue").json()["queued"]
-    assert all(j["state"] == "WAITING_FOR_TRACK_SELECTION" for j in client.get("/api/jobs").json())
+    assert all(j["state"] == "WAITING_FOR_ENCODE_SELECTION" for j in client.get("/api/jobs").json())
 
 
 def test_hold_blocks_already_delivered_work_until_resumed(client, new_job, monkeypatch):

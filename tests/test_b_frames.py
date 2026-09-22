@@ -151,6 +151,7 @@ def test_render_rechecks_actual_decoded_types_before_writing(
         source=lambda: Path("source.mkv"),
         check=lambda: None,
         output=lambda *args: pytest.fail("A non-B pair must never be written"),
+        progress=lambda *args, **kwargs: None,
         job=SimpleNamespace(
             id=new_job["id"],
             screenshot_policy={"count": 1},

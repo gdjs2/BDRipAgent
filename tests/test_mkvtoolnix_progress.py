@@ -4,10 +4,10 @@ import wave
 
 import pytest
 from sqlalchemy import select
+from worker.adapters.mkvtoolnix import MKVToolNixProgress
 
 from shared.db import session
 from shared.models import Event, Task
-from worker.adapters.mkvtoolnix import MKVToolNixProgress
 from worker.runtime import TaskContext, ToolError
 
 

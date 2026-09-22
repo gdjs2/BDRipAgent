@@ -27,7 +27,7 @@ def audio(codec, codec_id, **extra):
     "code,expected",
     [
         ("eng", "English"),
-        ("en-US", "English"),
+        ("en-US", "English (United States)"),
         ("jpn", "Japanese"),
         ("fre", "French"),
         ("chi", "Chinese"),

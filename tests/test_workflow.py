@@ -146,21 +146,25 @@ def test_worker_success_failure_and_duplicate_delivery(client, new_job, monkeypa
     execute(task_id)
     assert calls == [task_id]
     job = client.get(f"/api/jobs/{new_job['id']}").json()
-    assert job["state"] == "WAITING_FOR_TRACK_SELECTION"
+    assert job["state"] == "RUNNING_CRF_ANALYSIS"
     assert job["tasks"][0]["status"] == "SUCCEEDED"
     client.post(
         f"/api/jobs/{new_job['id']}/tracks/selection", json={"audio_track_ids": [], "subtitle_track_ids": []}
     )
     with session() as db:
-        task = db.scalar(select(Task).where(Task.job_id == new_job["id"], Task.status == "QUEUED"))
+        task = db.scalar(
+            select(Task).where(
+                Task.job_id == new_job["id"], Task.type == "crf_analysis", Task.status == "QUEUED"
+            )
+        )
 
     def fail(ctx):
         raise RuntimeError("expected fixture failure")
 
-    monkeypatch.setitem(HANDLERS, "prepare_tracks", fail)
+    monkeypatch.setitem(HANDLERS, "crf_analysis", fail)
     execute(task.id)
     job = client.get(f"/api/jobs/{new_job['id']}").json()
-    assert job["state"] == "PREPARING_TRACKS"
+    assert job["state"] == "RUNNING_CRF_ANALYSIS"
     assert any(
         t["status"] == "FAILED" and t["error_message"] == "expected fixture failure" for t in job["tasks"]
     )

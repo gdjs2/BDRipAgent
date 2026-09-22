@@ -11,6 +11,7 @@ minimum_contrast: 8
 minimum_blur_score: 15
 duplicate_hash_distance: 5
 screenshots:
+  best_count: 20
   decoder: cuda
   count: 7
   representative: 4
@@ -47,8 +48,12 @@ integrations:
     transcription: true
     model: small
     sample_count: 3
+    max_rounds: 6  # Hard limit; each job can override this (1–30).
     sample_seconds: 30
     cpu_threads: 2
+  subtitle_discovery:
+    max_candidates: 9
+    max_seconds: 1800
   subtitle_detection:
     sample_cues: 96
   sup2sup:
@@ -56,5 +61,9 @@ integrations:
     margin: 20
 agent:
   model: null
+  subtitle_cleanup:
+    model: gpt-5.6-luna
+    reasoning_effort: low
   timeout_seconds: 900
+  busy_timeout_seconds: 1800
   selection_attempts: 3

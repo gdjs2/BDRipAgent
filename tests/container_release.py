@@ -17,12 +17,12 @@ from worker.adapters.release_runner import run
 
 
 def main():
-    # Load the small formatting module without the application's pycountry dependency.
+    # Load the small formatting module without the application's language-label dependency.
     import runpy
     import sys
     from types import SimpleNamespace
 
-    with patch.dict(sys.modules, pycountry=SimpleNamespace()):
+    with patch.dict(sys.modules, langcodes=SimpleNamespace(Language=object)):
         formatter = runpy.run_path("/app/shared/naming.py")["source_description"]
     names = [
         "Movie.2026.1080p.Blu-ray.AVC.DTS-HD.MA.5.1@GROUP",
@@ -179,9 +179,15 @@ def main():
             "output_dir": str(root / "normal-output"),
             "cache_dir": str(root / "normal-cache"),
         }
+        custom_description = (
+            "[b]自定义电影介绍[/b]\nFirst paragraph.\n\nSecond paragraph with [i]formatting[/i]."
+        )
+        normal_request["details"] = {**normal_request["details"], "movie_description": custom_description}
         with patch.object(screenshots, "upload_image", upload):
             normal_result = run(normal_request, "fixture-token")
         normal_post = (root / "normal-output" / f"{normal_movie.stem}.bbcode.txt").read_text()
+        assert custom_description in normal_post
+        assert normal_post.count(custom_description) == 1
         assert not normal_result["smoke_test"] and "frame I:" in normal_post
         assert "SMOKE TEST" not in normal_post and ".x264.Info" in normal_post
         from uuid import uuid4
@@ -190,6 +196,7 @@ def main():
 
         ctx = SimpleNamespace(
             check=lambda: None,
+            progress=lambda *args, **kwargs: None,
             job=SimpleNamespace(id=str(uuid4()), release_name=normal_movie.stem),
             settings=SimpleNamespace(
                 workspace_root=root / "jobs",

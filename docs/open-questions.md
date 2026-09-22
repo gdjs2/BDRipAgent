@@ -17,11 +17,11 @@ Please refine these remaining assumptions:
    Users may edit the best list from the shortlist and choose any subset.
    Constraints fail explicitly if a short film or long take cannot satisfy them;
    they are not silently relaxed. Confirm the gap and any desired exception policy.
-2. **Release classes and title.** The upstream naming function fixes `1080p`,
-   `BluRay`, `-WiKi` and x265 `10bit`. This implementation follows it, and sets the
-   MKV title to the dotted release filename stem. Should 720p/2160p SDR sources,
-   editions/cuts or another group be supported, and should the MKV title instead
-   use a human-readable form? The worker currently preserves the source resolution.
+2. **Release classes.** The upstream naming function fixes `1080p`,
+   `BluRay`, `-WiKi` and x265 `10bit`. This implementation follows it for filenames;
+   the MKV container title uses `Movie Name (Year)`. Should 720p/2160p SDR sources,
+   editions/cuts or another group be supported? The worker currently preserves
+   the source resolution.
 3. **Encoder presets.** The existing slow profiles remain, now explicitly using
    high/main10. CRF Studio receives those same settings; its own placebo/slower
    presets and extra parameters are not silently substituted. Should the project

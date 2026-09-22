@@ -5,7 +5,7 @@ import av
 from worker.adapters.handbrake import Crop
 
 
-def timeline(path, check=lambda: None):
+def timeline(path, check=lambda: None, *, on_progress=None):
     points = []
     with av.open(str(path)) as container:
         for index, frame in enumerate(container.decode(video=0)):
@@ -17,8 +17,12 @@ def timeline(path, check=lambda: None):
             if points and pts <= points[-1]:
                 raise ValueError("Video presentation timestamps are not strictly increasing")
             points.append(pts)
+            if on_progress and index % 240 == 0:
+                on_progress(len(points), pts - points[0])
     if len(points) < 2:
         raise ValueError("Video contains fewer than two frames")
+    if on_progress:
+        on_progress(len(points), points[-1] - points[0])
     return points
 
 

@@ -8,6 +8,7 @@ import time
 
 from fastapi.testclient import TestClient
 
+import worker.tasks as task_worker
 from backend.app.main import app
 from shared.config import get_settings
 from worker.pipeline.stages import HANDLERS
@@ -19,6 +20,14 @@ def fixture_work(ctx):
 
 
 HANDLERS["analyze"] = fixture_work
+
+
+def fixture_advance(db, job):
+    # This harness tests admission only; don't start real media/agent work.
+    job.state = "WAITING_FOR_ENCODE_SELECTION"
+
+
+task_worker.advance = fixture_advance
 
 
 def main():
@@ -42,7 +51,7 @@ def main():
                 time.sleep(0.2)
             raise AssertionError(status())
 
-        change("/api/queue", {"paused": True, "max_concurrent_jobs": 2})
+        change("/api/queue", {"paused": True, "max_other_tasks": 2})
         jobs = []
         for index in range(4):
             response = client.post(
@@ -64,11 +73,11 @@ def main():
         running = wait_until(lambda q: len(q["running"]) == 2)
         assert {t["id"] for t in running["running"]} == set(ids[:2])
         print("PASS: two real Celery worker processes run jobs concurrently in queue order", flush=True)
-        change("/api/queue", {"max_concurrent_jobs": 1, "paused": True})
+        change("/api/queue", {"max_other_tasks": 1, "paused": True})
         wait_until(lambda q: not q["running"])
         assert len(status()["queued"]) == 2
         assert all(
-            client.get(f"/api/jobs/{job['id']}").json()["state"] == "WAITING_FOR_TRACK_SELECTION"
+            client.get(f"/api/jobs/{job['id']}").json()["state"] == "WAITING_FOR_ENCODE_SELECTION"
             for job in jobs[:2]
         )
         change("/api/queue", {"paused": False})
@@ -82,7 +91,7 @@ def main():
 
         wait_until(complete)
         details = [client.get(f"/api/jobs/{job['id']}").json() for job in jobs]
-        assert all(job["state"] == "WAITING_FOR_TRACK_SELECTION" for job in details)
+        assert all(job["state"] == "WAITING_FOR_ENCODE_SELECTION" for job in details)
         assert details[2]["tasks"][0]["finished_at"] <= details[3]["tasks"][0]["started_at"]
         print(
             "PASS: pause drains active stages, lowered limit prevents overlap, held work resumes", flush=True

@@ -1,5 +1,12 @@
 # Test coverage
 
+## They Will Kill You acceptance review
+
+See [the 2026-09-21 acceptance report](e2e-review-2026-09-21.md) for the real
+x264/x265 excerpt runs, full-movie review recovery, page-by-page browser checks,
+and the limits of what was verified. `tests/container_movie_e2e.py` is an opt-in
+actual-media harness that requires isolated `/review` storage.
+
 ## Encoding pause and configuration
 
 `tests/test_encoding_pause.py` exercises authenticated controls, unsupported and
@@ -10,6 +17,31 @@ test verifies old tasks keep their data with pause disabled. Frontend tests cove
 pause acknowledgements, cancellation states, exact command selection per attempt,
 literal shell-argument display, and crop/smoke dimensions. The configuration panel
 uses the persisted profile snapshot and recorded command, not current profile files.
+
+## HandBrake version upgrades
+
+`tests/container_handbrake.py` checks the installed HandBrake **1.11.2** against all
+four project profiles, each in CRF and two-pass bitrate mode. It uses real native
+commands and checks automatic crop, progress from both passes, frame count, PTS,
+codec, bit depth, color metadata and strict FFmpeg decoding. It also exercises the
+compatibility launcher with spaces and shell metacharacters in filenames. Run it
+without production mounts or credentials:
+
+```sh
+docker compose build worker
+docker run --rm --init --network none \
+  -v "$PWD/tests/container_handbrake.py:/app/container_handbrake.py:ro" \
+  bdripagent-worker python /app/container_handbrake.py
+```
+
+The fixture and outputs use a temporary directory in the disposable container.
+Run `tests/test_encoding_pause.py::test_real_handbrake_can_pause_resume_and_finish_valid_video`
+in a development test image with the upgraded CLI to verify real process-group
+pause/resume and complete output decoding as well.
+
+Verified on 2026-09-21: all eight native profile/rate-control combinations passed
+in the final worker image. The media, encode-target, scan-output and encoding-pause
+regression suites passed 53 tests with the upgraded CLI.
 
 ## Initial track review
 
@@ -28,6 +60,16 @@ downloaded on first use; no remote agent is called. `tests/container_track_revie
 checks real MKVToolNix output with custom Unicode labels and explicit true/false
 values for all five flags. Run these harnesses in an isolated worker test image;
 espeak is only needed for the speech fixture, not in production.
+
+## Track ordering
+
+The browser track suite exercises mouse/touch dragging, keyboard reordering, cancelled
+and cross-group drags, polling, deselect/reselect, saving and reloading, retained
+names/flags, and disabled handles after remux preparation begins. API tests verify
+that reordered ID arrays survive repeated saves and cannot change after the gate.
+`tests/container_track_extraction.py` feeds the actual prepared files to MKVToolNix
+and inspects its output: video first, then two reversed audio tracks and two reversed
+PGS tracks, plus cases with either or both groups omitted.
 
 ## MKVToolNix progress
 
@@ -195,7 +237,7 @@ docker run --rm --init --network none \
 ```
 
 The test expects COMPLETE, 288 source frames, a passing validation report, a final
-MKV with its generated WiKi filename/title and seven source/encode PNG pairs at
+MKV with its generated WiKi filename, `Movie Name (Year)` container title, and seven source/encode PNG pairs at
 exactly 640×360. It also verifies that the mux restores the source video origin.
 All generated state is inside the disposable test container. It does not consume production credentials.
 Set `SMOKE_PROFILE=x265-live` in the test container to exercise the default 10-bit
@@ -535,7 +577,14 @@ jobs. `tests/test_subtitle_ocr.py` generates original PGS bitmaps and exercises 
 Sup2Sup rendering, Tesseract, OpenCC, task progress, and MKVToolNix names/IETF tags/SDH
 flags. These native tests require the worker OCR packages and `fonts-noto-cjk` for
 fixture generation. The latter is test-only; production renders existing bitmaps.
-Model responses are mocked in tests, so no live Codex account or model call is used.
+`tests/test_subtitle_languages.py` covers canonical ISO aliases/BCP 47 tags,
+non-Chinese labels, script and region distinctions, invalid/private codes, source
+mislabeling, OCR model choice, stale-analysis invalidation and corrective retries.
+Track-review tests accept actual subtitle cue citations, reject cross-track or
+invented IDs, and exercise successful correction and bounded failure. Native OCR
+fixtures include French, German and Russian, and MKV metadata checks include Latin,
+Cyrillic, Arabic and regional language tags. Model responses are mocked in tests,
+so no live Codex account or model call is used.
 
 Release bundle tests cover timestamp ownership, collision handling, regeneration,
 copy fallback, and preserving the original three-file WiKi torrent payload. Legacy
@@ -550,3 +599,249 @@ creates fixture rows and confirms simultaneous x264/x265 requests produce one wi
 and one conflict for frame 1000. Unit/API tests additionally cover nearby frames,
 the exact spacing boundary, gallery reservation markers, and deleted-job cleanup.
 Screenshot rendering tests check that the last row uses the final MKV filename.
+
+
+Track analysis pipeline regressions (`test_track_analysis_pipeline.py`) use synchronization
+barriers to verify that preparing the next subtitle overlaps the current agent review.
+They check automatic/idempotent scheduling, checkpoint recovery after a late failure,
+and cancellation of background preparation. `test_source_tracks.py` races paired jobs
+against the shared extraction cache, verifies one source pass, missing-timestamp repair,
+legacy PGS reuse and changed-source invalidation. Native OCR tests also exercise one
+real audio/PGS/video-timestamp extraction reused for audio sampling and frame indexing.
+
+The optional `frontend/tests/browser-tracks.cjs` runs against a built frontend with
+Playwright installed (or provided via `NODE_PATH`). It mocks all API requests and checks
+compact rows, automatic analysis, manual names, explicit false flag overrides, and
+mobile overflow. `UI_SCREENSHOT_DIR` chooses the output folder for its screenshots.
+
+
+Adaptive audio and independent workflow regression tests are in
+`tests/test_adaptive_audio.py` and `tests/test_parallel_workflow.py`. They prove
+that the agent can request successive rounds within its configured budget, the
+hard limit produces an inconclusive human handoff, a cancelled round reuses
+prepared evidence, exhaustion remains inconclusive, and cited tracks/samples must
+exist. A thread-barrier test runs CRF and track review concurrently
+while saving a release draft, then verifies all results survive. Additional
+checks cover early editable track choices, the late remux join, lane-scoped retry,
+worker capacity, and migration of the active-task uniqueness constraint.
+
+
+`tests/test_queue_pools.py` verifies independent encoding, CRF, and other-task
+limits, cross-pool admission when one pool is full, held tasks, shared worker
+capacity, and paused/cancelling encoder reservations. A worker-claim concurrency
+test starts one encode alongside CRF and three source scans, rejects additional
+other tasks, and checks duplicate delivery after slots reopen.
+`tests/test_queue_pool_migration.py` exercises upgrade/downgrade, preservation of
+queue pause, defaults, and database constraints. The optional Playwright harness
+`frontend/tests/browser-queue.cjs` checks all three controls, usage counters, persisted
+updates/reload, queue pause, and desktop/mobile layout with mocked APIs.
+
+
+Phase progress uses completed work, with separate budgets for extraction, local
+analysis, agent review, rendering, and publication. Tool percentages remain visible
+as tool metrics; they do not finish the whole task. Parallel track preparation and
+review share an aggregate progress tree. Unknown-duration operations (model loading,
+agent calls, subtitle cropping, encoder flushing) use an activity indicator. Only a
+successfully committed task reaches 100%. Validation reports decoded frames and
+relative timestamps; release checksums and copies report processed bytes.
+
+`tests/test_phase_progress.py` checks nested/concurrent progress, streaming callbacks,
+transcription completion, validation frames, publication bytes, and the 100% boundary.
+`frontend/tests/task-progress.test.mjs` covers task states and older worker reports.
+With Playwright available, run `npm run build && node tests/browser-progress.cjs`
+from `frontend/` to check measured progress, unknown work, completion, CRF flushing,
+and desktop/mobile layout. `UI_SCREENSHOT_DIR` selects the screenshot folder.
+
+
+Source-sharing regressions in `tests/test_source_sharing.py` cover original track
+order, reuse without copying manual choices, cache invalidation, missing evidence,
+legacy completed-job adoption, and portable audio/OCR evidence after donor cleanup.
+`test_track_analysis_pipeline.py` also verifies that concurrent codec jobs perform
+one shared review and resume from completed subtitle checkpoints after a failure.
+Release tests cover same-source defaults, independent saved drafts, and multiline
+movie-description BBCode. The native release harness checks the custom description
+in the post generated by BDRip_Scripts, alongside torrent piece verification.
+The track browser harness checks initial source order, drag ordering, shared release
+prefill, preservation of unsaved edits during polling, and saving a custom description.
+
+
+`tests/test_source_choices.py` checks bidirectional sharing of selections/order/names/
+flags, existing and future encodes, deferred application after review, legacy adoption,
+source isolation, frozen remux snapshots, and simultaneous edits with one revision
+winner. A worker regression follows automatically shared choices through extraction,
+preparation, and exact mux argument ordering. The track browser harness checks live
+updates from another encode, preservation of local edits and drag order, and explicit
+loading of the new shared revision before saving again.
+
+
+`tests/test_cpu_monitor.py` covers host-counter deltas, guest-time double-counting,
+I/O wait, resets/hotplug, unreadable data, authenticated access, and stable sampling
+across multiple browser reads. `tests/test_worker_routing.py` verifies encoding-only
+routing, CRF routing to its dedicated queue, stale-queue redelivery, and rejection of work delivered to the wrong worker role. Launcher tests
+cover preserving an existing encoder, legacy mixed-worker protection, and explicit
+encoder-update readiness checks.
+
+`tests/container_worker_isolation.py` is a disposable PostgreSQL/Redis/Celery harness
+restricted to `worker_isolation_test`. With a general worker consuming `bdrip.other`
+a CRF worker consuming `bdrip.crf`, and an encoder consuming `bdrip.encoding`, it runs a 35-second fixture task, replaces
+the general container, and verifies the encoder retains its lease and finishes;
+CRF runs in its own worker; only final encodes use the encoder.
+The fixture substitutes waits for media processing and never touches real movies.
+
+With Playwright installed, `npm run build && node tests/browser-system.cjs` checks
+folded logs stop traffic, agent streams open on demand, CPU readings update, a
+96-core grid fits desktop/mobile viewports, dragging/keyboard movement stays on
+screen, collapse preference survives reload, and missing data is not shown as 0%.
+
+
+### Remux revisions, language corrections and CPU history
+
+`tests/test_remux.py` covers explicit post-mux revisions, canonical language
+verification, preserving detection evidence, shared manual corrections, separate
+ART generations, three-day expiry, and guards against deleting current, modified,
+linked or busy outputs. Its native fixture runs real MKVToolNix, screenshot
+rendering and the pinned BDRip release tools, verifies changed language/order and
+new MD5/torrent infohash, checks that the encoded video stays byte-identical, and
+exercises an interrupted second remux and expired backup cleanup.
+
+`frontend/tests/cpu-history.test.mjs` checks time slots, missing samples, expiry and
+color boundaries. `browser-system.cjs` covers scrolling history, reduced motion,
+keyboard inspection, mobile bounds and both live-profile defaults.
+`browser-tracks.cjs` also covers completed-job remux editing, rejected/normalized
+language codes, readable language names and the mobile track editor.
+The launcher and routing tests cover a temporary general-worker bridge that stops
+legacy consumption and forwards old-queue encoding tasks without claiming them.
+
+
+### Monitor metrics and encoding-target edits
+
+`tests/test_cpu_monitor.py` covers host 1/5/15-minute load averages, averaging
+current per-core frequency readings, invalid/missing samples, and independent
+metric availability. `tests/test_encode_target_edit.py` covers queued edits,
+preserved hold/priority/profile, cancelled/failed edits followed by retry,
+rate-control switching, numeric validation, and rejection after worker admission
+or while paused/stopping. No active encoder settings are changed by these tests.
+
+`node tests/browser-encode-target.cjs` checks saving/reloading a queued bitrate,
+saving a cancelled job without starting it, explicit retry, changing rate-control
+mode, read-only running/completed/smoke tasks, and mobile layout. The system browser
+harness also checks live load/frequency updates and unavailable readings without
+hiding valid CPU utilization.
+
+## Subtitle discovery and timing alignment
+
+`tests/test_subtitle_discovery.py` covers strict agent schemas, language/script
+coverage, web-search isolation, source-shared scheduling, cancellation/selection
+gates, unsafe downloads/archives, and timing alignment. Known offset/FPS fixtures
+are accepted; invented or duplicate citations, insufficient timeline coverage,
+wrong transforms and different-cut drift are rejected.
+
+The native integration fixture supplies deterministic search, dialogue-match and
+download responses, then uses real Subtitle Edit, Sup2sup and MKVToolNix. It
+converts and aligns Chinese SRT, verifies source/cropped PGS dimensions, confirms
+source-wide sharing and the fresh-review requirement, reuses the cropped PGS,
+and checks the remuxed language. Additional fixtures render Korean SRT and
+Traditional Chinese ASS and verify PGS timestamp changes preserve bitmap payloads.
+No real movie or remote subtitle download is required for these tests.
+
+`frontend/tests/browser-subtitle-discovery.cjs` tests automatic opt-in, manual
+search, progress/cancel controls, the confirmation gate, unselected imported
+tracks, source links, alignment details and mobile overflow using mocked APIs.
+Run it like the other Playwright browser checks after building the frontend.
+
+Verification on 2026-09-21: 110 focused backend/worker regressions passed, along
+with the discovery browser acceptance and TypeScript production build. A separate
+live read-only agent search returned cited candidates through the authenticated
+endpoint. A live bilingual alignment fixture matched nine Chinese/English cue
+pairs and recovered the known 25/24 timing scale and +1.200-second offset. These
+probes did not import subtitles or change existing movie jobs. Current movie
+workspaces were checked read-only and contain source OCR cues spanning the film;
+a complete real-movie download/alignment remains dependent on a suitable online
+subtitle and is not implied by the synthetic media tests.
+
+## Persistent source release information
+
+`tests/test_source_release_details.py` covers database persistence after all source
+jobs are removed, new database sessions, revision conflicts, no-op saves, retained
+generation snapshots, latest-valid legacy backfill (including removed jobs), and
+the additive `0009` migration in both directions. Source-sharing tests ensure an
+existing saved draft follows later source-wide edits and changed source identities
+stay isolated. The release-worker test edits a sibling after queueing generation
+and verifies the worker still receives its original source description.
+
+`frontend/tests/browser-source-release.cjs` exercises two open encode pages: shared
+values refresh, unsaved text survives incoming changes, stale saves are rejected
+and recoverable, removed donor jobs have no broken link, and existing artifacts
+show a notice when their information is older. It checks the form on desktop and
+mobile.
+
+## Artifact playback and encoder information
+
+`tests/test_artifact_media.py` renders a synthetic MKV with two video tracks, two
+audio tracks, SRT and PGS. It checks real preview segments, subtitle cues spanning
+seek boundaries, stream selection, silent playback, timestamps, authorization,
+path containment, stale-file rejection, subprocess limits, timeout/disconnect
+cleanup, legacy encoder-log summaries and video-only bitrate fallback.
+
+For the browser check, run `python -m tests.container_media_preview` in the native
+media test environment (FFmpeg, MediaInfo, MKVToolNix and Subtitle Edit required).
+This starts an isolated API on port 8000 with synthetic media and a temporary
+SQLite database. Build the frontend and run `tests/browser-media-preview.cjs`
+with Playwright available and `MEDIA_TEST_API` pointing to that server. The check
+plays real HLS, seeks across segment boundaries, changes video/audio/PGS/text
+tracks while paused and playing, preserves position/speed, and checks the
+MediaInfo, encoder summary, source bitrate and mobile layout.
+
+Verification on 2026-09-22: 83 focused backend regressions and the real Chromium
+playback check passed. The deployed API also returned encoder summaries for both
+They Will Kill You encodes, the source video bitrate (32,860,648 bit/s), and the
+final x265 MediaInfo report. A six-second preview from 03:00 converted HEVC/AC3
+with a selected PGS track to playable H.264/AAC. This was a bounded playback check;
+original files and running processing workers were left unchanged.
+
+## Adjustable screenshot recommendations
+
+`tests/test_screenshot_review.py` checks recommendation counts of 2, 15, 20 and
+40, reuse of the existing shortlist, strict request bounds, the running-review
+guard, preserving existing finals, manual curation beyond 15, and choosing seven
+final pairs from twenty options. The fallback count is bounded by available
+candidates. New jobs default to 20; old policies without this field retain 15.
+
+`frontend/tests/browser-screenshot-count.cjs` checks saving and refreshing the
+count, preserving existing images on save, disabling edits during review,
+cross-codec reservations, choosing seven from twenty, limiting the bulk selection
+to fifteen, and mobile layout. Verification: 65 focused screenshot regressions,
+the browser check, and the production frontend build passed.
+
+## Re-encoding and subtitle cleanup
+
+`tests/test_reencode.py` checks CRF/bitrate revisions, immutable-source checks,
+profile limits, double submissions, queued follow-up cancellation, active-task
+protection, preserving previous output files and source settings, and invalidating
+old screenshot/validation state. The encoding browser regression also queues a
+replacement from a completed job.
+
+`tests/test_subtitle_cleanup.py` checks full-cue coverage across batches, ad removal,
+typo correction, timing preservation, bilingual/wrong-language rejection, uncertain
+text, invented evidence, unsupported duplicate removals, markup and strict schemas.
+The native subtitle-discovery test removes an ad and corrects a Chinese typo before
+real Subtitle Edit rendering, alignment validation, Sup2sup cropping, shared track
+registration and remux preparation. 78 focused backend regressions passed, plus
+encoding/subtitle browser checks and the frontend production build.
+
+Live deployed-agent checks also passed on synthetic dialogue: it removed a
+subtitle-site advertisement, corrected a missing apostrophe, and rejected parallel
+English/Chinese translations. These checks imported no tracks and changed no movie
+jobs. The deployed API reports re-encoding available for the completed They Will
+Kill You and The Phoenician Scheme jobs; no real re-encode was started during
+verification. Active encodes, validation and release generation were preserved.
+
+## Removing discovered subtitles
+
+`tests/test_subtitle_removal.py` checks shared removal from existing/future encodes,
+retained files and completed mux snapshots, removal from editable selections,
+report updates, repeat requests, monotonic external-track IDs, active sibling
+work, authentication, and rejection of native/manual tracks. The subtitle browser
+check removes a selected agent-found track and verifies that its row disappears
+and the report marks it removed. 47 focused backend regressions and the browser
+check passed; the frontend production build and Ruff checks passed.

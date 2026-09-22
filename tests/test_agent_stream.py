@@ -36,12 +36,16 @@ for line in sys.stdin:
     if method == "initialize":
         send({"id": value["id"], "result": {}})
     elif method == "thread/start":
+        chosen_model = value["params"].get("model")
         assert value["params"]["sandbox"] == "read-only"
         assert value["params"]["approvalPolicy"] == "never"
         assert value["params"]["ephemeral"] is True
         send({"id": value["id"], "result": {"thread": {"id": "test-thread"}}})
     elif method == "turn/start":
         params = value["params"]
+        if params["input"][0]["text"] == "verify-model-options":
+            assert chosen_model == "gpt-5.6-luna"
+            assert params["effort"] == "low"
         assert params["outputSchema"]["properties"]["selected"]
         assert params["input"][1]["type"] == "localImage"
         assert Path(params["input"][1]["path"]).is_file()
@@ -145,8 +149,8 @@ def test_agent_service_streams_result_and_releases_lock(environment, monkeypatch
         )
     assert response.status_code == 200
     records = [json.loads(line) for line in response.text.splitlines()]
-    assert [r["type"] for r in records if r["type"] != "heartbeat"] == ["prompt", "delta", "result"]
-    assert not agent_service.lock.locked()
+    assert [r["type"] for r in records if r["type"] != "heartbeat"] == ["status", "prompt", "delta", "result"]
+    assert agent_service.agent_queue.snapshot() == {"running": 0, "waiting": 0}
 
 
 def test_worker_persists_stream_and_task_endpoint_replays_it(client, new_job):
@@ -200,3 +204,21 @@ def test_worker_persists_stream_and_task_endpoint_replays_it(client, new_job):
     assert '"text": "Choose"' not in resumed and "part 1 part 2" in resumed
     client.headers.clear()
     assert client.get(f"/api/tasks/{task_id}/agent-events").status_code == 401
+
+
+def test_codex_stream_passes_scoped_model_and_effort(fake_codex):
+    from agent.schemas import Selection
+
+    events = []
+    answer, thread = codex_stream.invoke(
+        "verify-model-options",
+        [fake_codex],
+        Selection.model_json_schema(),
+        events.append,
+        lambda: None,
+        model="gpt-5.6-luna",
+        reasoning_effort="low",
+    )
+    assert json.loads(answer) == {"selected": []}
+    status = next(e for e in events if e["type"] == "status")
+    assert status["model"] == "gpt-5.6-luna" and status["reasoning_effort"] == "low"

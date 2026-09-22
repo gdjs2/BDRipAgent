@@ -22,6 +22,9 @@ def ready_job(new_job):
     gate(new_job["id"], "WAITING_FOR_ENCODE_SELECTION", profile="x265-live")
     with session() as db:
         job = db.get(MovieJob, new_job["id"])
+        from shared.models import TrackSelection
+
+        db.add(TrackSelection(job_id=job.id, audio_track_ids=[], subtitle_track_ids=[]))
         job.analysis = {
             "video": {"width": 1920, "height": 1080, "bit_depth": 8, "codec": "h264", "duration": 1000},
             "crop": {"top": 104, "bottom": 104, "left": 0, "right": 0},

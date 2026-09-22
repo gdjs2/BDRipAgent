@@ -20,6 +20,7 @@ from worker.adapters.frame_index import frame_number, source_frame_index
 from worker.adapters.handbrake import Crop
 from worker.adapters.screenshot_agent import select_screenshots
 from worker.adapters.screenshot_decoder import candidate_decoder, window_frames
+from worker.progress import plan
 from worker.runtime import Interrupted
 
 PICTURE_TYPES = {1: "I", 2: "P", 3: "B", 4: "S", 5: "SI", 6: "SP", 7: "BI"}
@@ -169,6 +170,7 @@ def window_candidate(ctx, frames, points, crop, config, *, bucket, anchor):
 
 
 def generate(ctx):
+    ctx.progress(None, phase="Preparing screenshot frame index")
     config, crop = behavior(), Crop(**ctx.job.analysis["crop"])
     points, frame_index_path = source_frame_index(ctx)
     first_pts = ctx.job.validation["metrics"]["source_first_pts"]
@@ -243,7 +245,11 @@ def generate(ctx):
         f"in {decoder_info['elapsed_seconds']:.1f}s (plus short CPU B-frame verification seeks)."
     )
     ctx.progress(
-        95, phase="Preparing candidate contact sheets", candidate_count=len(candidates), **decoder_info
+        95,
+        phase="Preparing candidate contact sheets",
+        indeterminate=True,
+        candidate_count=len(candidates),
+        **decoder_info,
     )
     if len(candidates) < ctx.job.screenshot_policy["count"]:
         raise ValueError(
@@ -281,6 +287,8 @@ def generate(ctx):
 
 
 def select_frames(ctx):
+    steps = plan(ctx, preparation=25, agent=35, comparisons=35, thumbnails=5)
+    steps["preparation"].progress(None, phase="Preparing screenshot review")
     index = json.loads(contained(ctx.workspace, ctx.job.analysis["candidate_index"], exists=True).read_text())
     root = job_dir(job_dir(ctx.settings.cache_root / "agent", ctx.job.id), ctx.task_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -316,7 +324,7 @@ def select_frames(ctx):
     # Also enforce the rule for candidate indexes created before B-frame checks
     # existed. Only source images are sent to the visual agent.
     if any(not is_b_frame_pair(c) for c in candidates):
-        candidates = verify_b_frame_candidates(ctx, candidates)
+        candidates = verify_b_frame_candidates(steps["preparation"], candidates, progress_span=95)
         for candidate in candidates:
             ctx.artifact(contained(ctx.workspace, candidate["path"]), "SCREENSHOT_CANDIDATE", info=candidate)
         if len(candidates) >= ctx.job.screenshot_policy["count"]:
@@ -364,7 +372,9 @@ def select_frames(ctx):
         },
     )
     timeout = behavior()["agent"]["timeout_seconds"] * (len(sheets) + 5)
-    result = select_screenshots(ctx, timeout)
+    steps["preparation"].done("Screenshot review inputs ready")
+    result = select_screenshots(steps["agent"], timeout)
+    steps["agent"].done("Screenshot agent review complete")
     ctx.check()
     shortlist = result["shortlisted_ids"]
     candidate_ids = {c["candidate_id"] for c in candidates}
@@ -393,7 +403,9 @@ def select_frames(ctx):
         for c in candidates
         if c["candidate_id"] in recommendations
     ]
-    comparisons = render_pairs(ctx, review_rows, review=True)
+    comparisons = render_pairs(steps["comparisons"], review_rows, review=True)
+    steps["comparisons"].done("Review comparisons ready")
+    steps["thumbnails"].progress(None, phase="Preparing shortlist thumbnails")
     for candidate in candidates:
         if candidate["candidate_id"] not in shortlist:
             continue
@@ -402,6 +414,7 @@ def select_frames(ctx):
             source_image.thumbnail((640, 360))
             source_image.convert("RGB").save(thumbnail, quality=85)
         candidate["thumbnail"] = ctx.artifact(thumbnail, "SCREENSHOT_THUMBNAIL")
+    steps["thumbnails"].done("Screenshot review ready")
 
     def save(db, job):
         choices = {c["candidate_id"]: c for c in result.get("shortlisted_choices", [])}
@@ -583,6 +596,7 @@ def render_pairs(ctx, selected, *, review=False):
     metrics = ctx.job.validation["metrics"]
     tolerance = 0.003
     updates = {}
+    ctx.progress(0, phase="Rendering screenshot comparisons", completed_pairs=0, total_pairs=len(selected))
     for index, shot in enumerate(selected):
         ctx.check()
         c = shot.info
@@ -635,10 +649,12 @@ def render_pairs(ctx, selected, *, review=False):
                 },
             )
         updates[shot.id] = output
-        if review:
-            ctx.progress(90 + (index + 1) / len(selected) * 9, phase="Preparing review comparisons")
-        else:
-            ctx.progress((index + 1) / len(selected) * 100)
+        ctx.progress(
+            (index + 1) / len(selected) * 100,
+            phase="Preparing review comparisons" if review else "Rendering screenshot comparisons",
+            completed_pairs=index + 1,
+            total_pairs=len(selected),
+        )
     return updates
 
 

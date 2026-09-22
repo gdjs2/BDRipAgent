@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { taskPage } from "./job-status";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EncodingPauseButton } from "./EncodingPauseButton";
@@ -21,20 +22,53 @@ type QueueTask = {
   paused_at?: string | null;
 };
 type QueueState = {
-  max_concurrent_jobs: number;
-  effective_limit: number;
+  max_concurrent_jobs?: number;
+  effective_limit?: number;
+  max_encoding_tasks: number;
+  max_crf_tasks?: number;
+  max_other_tasks: number;
+  max_release_tasks?: number;
+  running_release_tasks?: number;
+  effective_encoding_limit: number;
+  effective_crf_limit?: number;
+  effective_other_limit: number;
+  running_encoding_tasks: number;
+  running_crf_tasks?: number;
+  running_other_tasks: number;
   capacity: number;
   paused: boolean;
   running: QueueTask[];
   queued: QueueTask[];
 };
 
-function useQueue() {
+export function useQueue() {
   return useQuery({
     queryKey: ["queue"],
     queryFn: () => api<QueueState>("/queue"),
     refetchInterval: 3000,
   });
+}
+
+function PoolUsage({ data }: { data: QueueState }) {
+  return (
+    <>
+      Encoding {data.running_encoding_tasks}/{data.effective_encoding_limit}
+      {typeof data.max_crf_tasks === "number" && (
+        <>
+          {" "}
+          · CRF {data.running_crf_tasks}/{data.effective_crf_limit}
+        </>
+      )}
+      {" · Other tasks "}
+      {data.running_other_tasks}/{data.effective_other_limit}
+      {typeof data.max_release_tasks === "number" && (
+        <>
+          {" "}
+          (release {data.running_release_tasks}/{data.max_release_tasks})
+        </>
+      )}
+    </>
+  );
 }
 
 export function QueueSummary() {
@@ -44,14 +78,22 @@ export function QueueSummary() {
       <div>
         <h2>
           Processing queue{" "}
-          {data?.paused && <span className="badge">Paused</span>}
+          {data?.paused && <span className="badge needs-input">Paused</span>}
         </h2>
         {data && (
           <p>
-            {data.running.length} running ·{" "}
-            {data.queued.filter((t) => !t.held).length} queued ·{" "}
-            {data.queued.filter((t) => t.held).length} held · limit{" "}
-            {data.effective_limit}
+            {typeof data.max_encoding_tasks === "number" ? (
+              <>
+                <PoolUsage data={data} />
+              </>
+            ) : (
+              <>
+                {new Set(data.running.map((task) => task.job_id)).size} /{" "}
+                {data.effective_limit} running jobs
+              </>
+            )}{" "}
+            · {data.queued.filter((t) => !t.held).length} queued ·{" "}
+            {data.queued.filter((t) => t.held).length} held
           </p>
         )}
         {error && <p className="error">{error.message}</p>}
@@ -66,7 +108,9 @@ export function QueueSummary() {
 export function QueuePage() {
   const query = useQueryClient();
   const { data, error } = useQueue();
-  const [draftLimit, setDraftLimit] = useState<string | null>(null);
+  const [draftEncoding, setDraftEncoding] = useState<string | null>(null);
+  const [draftCrf, setDraftCrf] = useState<string | null>(null);
+  const [draftOther, setDraftOther] = useState<string | null>(null);
   const change = useMutation({
     mutationFn: ({
       path,
@@ -99,7 +143,8 @@ export function QueuePage() {
           <div className="eyebrow">WORK SCHEDULING</div>
           <h1>Processing queue</h1>
           <p>
-            Choose how many jobs run at once and which queued job goes next.
+            Set separate limits for encoding, CRF analysis, and other tasks, and
+            choose which queued task goes next.
           </p>
         </div>
       </header>
@@ -114,7 +159,7 @@ export function QueuePage() {
             <div className="section-heading">
               <h2>{data.paused ? "Queue paused" : "Queue running"}</h2>
               <button
-                className="secondary"
+                className={`secondary ${data.paused ? "needs-input" : ""}`}
                 disabled={change.isPending}
                 onClick={() =>
                   change.mutate({
@@ -126,56 +171,121 @@ export function QueuePage() {
                 {data.paused ? "Resume queue" : "Pause queue"}
               </button>
             </div>
-            <form
-              className="inline-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                change.mutate(
-                  {
-                    path: "/queue",
-                    body: {
-                      max_concurrent_jobs: Number(
-                        draftLimit ?? data.max_concurrent_jobs,
-                      ),
-                    },
-                  },
-                  { onSuccess: () => setDraftLimit(null) },
-                );
-              }}
-            >
-              <label>
-                Maximum simultaneous jobs
-                <input
-                  required
-                  type="number"
-                  min="1"
-                  max={data.capacity}
-                  step="1"
-                  value={draftLimit ?? data.max_concurrent_jobs}
-                  onChange={(event) => setDraftLimit(event.target.value)}
-                />
-              </label>
-              <button disabled={change.isPending}>Apply limit</button>
-              <span>
-                {data.running.length} running / {data.effective_limit} slots
-              </span>
-            </form>
-            <p className="muted">
-              The limit applies to automatic stages, including analysis,
-              encoding and validation. Jobs waiting for your track or CRF
-              decision use no slot.
-            </p>
+            {typeof data.max_encoding_tasks !== "number" ? (
+              <p className="callout" role="status">
+                The current server uses a shared limit of {data.effective_limit}{" "}
+                running jobs. Separate encoding, CRF, and other-task limits
+                become available after the server update. Running jobs can
+                continue with their current settings.
+              </p>
+            ) : (
+              <>
+                <form
+                  className="inline-form queue-limit-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    change.mutate(
+                      {
+                        path: "/queue",
+                        body: {
+                          max_encoding_tasks: Number(
+                            draftEncoding ?? data.max_encoding_tasks,
+                          ),
+                          ...(typeof data.max_crf_tasks === "number"
+                            ? {
+                                max_crf_tasks: Number(
+                                  draftCrf ?? data.max_crf_tasks,
+                                ),
+                              }
+                            : {}),
+                          max_other_tasks: Number(
+                            draftOther ?? data.max_other_tasks,
+                          ),
+                        },
+                      },
+                      {
+                        onSuccess: () => {
+                          setDraftEncoding(null);
+                          setDraftCrf(null);
+                          setDraftOther(null);
+                        },
+                      },
+                    );
+                  }}
+                >
+                  <label>
+                    Maximum encoding tasks
+                    <input
+                      required
+                      type="number"
+                      min="1"
+                      max={data.capacity}
+                      step="1"
+                      disabled={change.isPending}
+                      value={draftEncoding ?? data.max_encoding_tasks}
+                      onChange={(event) => setDraftEncoding(event.target.value)}
+                    />
+                  </label>
+                  {typeof data.max_crf_tasks === "number" && (
+                    <label>
+                      Maximum CRF analysis tasks
+                      <input
+                        required
+                        type="number"
+                        min="1"
+                        max={data.capacity}
+                        step="1"
+                        disabled={change.isPending}
+                        value={draftCrf ?? data.max_crf_tasks}
+                        onChange={(event) => setDraftCrf(event.target.value)}
+                      />
+                    </label>
+                  )}
+                  <label>
+                    Maximum other tasks
+                    <input
+                      required
+                      type="number"
+                      min="1"
+                      max={data.capacity}
+                      step="1"
+                      disabled={change.isPending}
+                      value={draftOther ?? data.max_other_tasks}
+                      onChange={(event) => setDraftOther(event.target.value)}
+                    />
+                  </label>
+                  <button disabled={change.isPending}>Apply limits</button>
+                  <span>
+                    <PoolUsage data={data} />
+                  </span>
+                </form>
+                <p className="muted">
+                  {typeof data.max_crf_tasks === "number"
+                    ? "Final video encoding and CRF analysis each have their own queue and limit. Source scans, track review, extraction, validation, remuxing, screenshots and release generation share the other-task limit."
+                    : "CRF analysis shares other-task slots on this server. Its separate limit becomes available after the server update."}{" "}
+                  {typeof data.max_release_tasks === "number" && (
+                    <>
+                      Release generation runs one task at a time within the
+                      other-task limit.{" "}
+                    </>
+                  )}
+                  Limits count tasks across all jobs, including tasks running
+                  alongside one another in the same job. At most {data.capacity}{" "}
+                  tasks run in total.
+                </p>
+              </>
+            )}
             <p className="muted">
               Pause queue stops new work from starting. Use Pause encoding on a
               running encode to suspend it and retain its progress. Paused
-              encodes keep their slots. Higher limits share CPU and memory
-              between jobs.
+              encodes keep their encoding slots. Lowering a limit lets running
+              tasks finish. Higher limits share CPU and memory between jobs.
             </p>
           </section>
           <section>
-            <h2>Running jobs</h2>
+            <h2>Running tasks</h2>
             {data.running.length === 0 && (
-              <p className="muted">No jobs are running.</p>
+              <p className="muted">No tasks are running.</p>
             )}
             {data.running.map((task) => (
               <div className="queue-row" key={task.id}>
@@ -186,14 +296,14 @@ export function QueuePage() {
                     {task.smoke_test && " · Smoke test"}
                   </span>
                 </Link>
-                <span className="badge">
+                <span
+                  className={`badge ${encodingPauseState(task)?.status === "Paused" ? "needs-input" : "running"}`}
+                >
                   {encodingPauseState(task)?.status ??
                     (task.cancel_requested ? "Stopping" : "Running")}
                 </span>
                 <EncodingPauseButton task={task} />
-                <Link
-                  to={`/jobs/${task.job_id}/${task.type === "crf_analysis" ? "crf" : "encode"}`}
-                >
+                <Link to={`/jobs/${task.job_id}/${taskPage(task.type)}`}>
                   View progress →
                 </Link>
               </div>
@@ -201,11 +311,12 @@ export function QueuePage() {
           </section>
           <section>
             <div className="section-heading">
-              <h2>Queued jobs</h2>
+              <h2>Queued tasks</h2>
               <span>{data.queued.length} waiting</span>
             </div>
             <p className="muted">
-              Ready jobs start in this order when a slot is free. Held jobs keep
+              Ready tasks start in this order when their pool has a free slot. A
+              full encoding pool does not block other tasks. Held tasks keep
               their place and are skipped until resumed.
             </p>
             {data.queued.length === 0 && (
@@ -227,7 +338,11 @@ export function QueuePage() {
                     {task.smoke_test && " · Smoke test"}
                   </span>
                 </Link>
-                <span className="badge">{task.held ? "Held" : "Queued"}</span>
+                <span
+                  className={`badge ${task.held ? "needs-input" : "queued"}`}
+                >
+                  {task.held ? "Held" : "Queued"}
+                </span>
                 <div className="queue-actions">
                   <button
                     className="secondary"
@@ -248,7 +363,7 @@ export function QueuePage() {
                     ↓
                   </button>
                   <button
-                    className="secondary"
+                    className={`secondary ${task.held ? "needs-input" : ""}`}
                     disabled={change.isPending}
                     onClick={() =>
                       change.mutate({
@@ -257,7 +372,7 @@ export function QueuePage() {
                       })
                     }
                   >
-                    {task.held ? "Resume job" : "Hold job"}
+                    {task.held ? "Resume task" : "Hold task"}
                   </button>
                 </div>
               </div>

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, clock, readable } from "./api";
@@ -21,6 +21,23 @@ export function ScreenshotGallery({
   controls: ReactNode;
 }) {
   const query = useQueryClient();
+  const target = job.screenshot_policy.best_count ?? 15;
+  const [bestCount, setBestCount] = useState(target);
+  useEffect(() => setBestCount(target), [target, job.id]);
+  const validCount =
+    Number.isInteger(bestCount) && bestCount >= 2 && bestCount <= 40;
+  const reviewing = job.tasks.some(
+    (task) => task.type === "select_screenshots" && task.status === "RUNNING",
+  );
+  const saveCount = useMutation({
+    mutationFn: () =>
+      api<Job>(
+        `/jobs/${job.id}/screenshots/best-count`,
+        { best_count: bestCount },
+        "PATCH",
+      ),
+    onSuccess: (updated) => query.setQueryData(["job", job.id], updated),
+  });
   const data = useQuery({
     queryKey: ["screenshots", job.id],
     queryFn: () => api<GalleryData>(`/jobs/${job.id}/screenshots`),
@@ -71,7 +88,8 @@ export function ScreenshotGallery({
     },
   });
   const prepare = useMutation({
-    mutationFn: () => api(`/jobs/${job.id}/screenshots/review`, {}),
+    mutationFn: () =>
+      api(`/jobs/${job.id}/screenshots/review`, { best_count: bestCount }),
     onSuccess: () => {
       query.invalidateQueries({ queryKey: ["job", job.id] });
       setDraft(null);
@@ -99,7 +117,11 @@ export function ScreenshotGallery({
       choose.reset();
     },
   });
-  const editing = curate.isPending || choose.isPending || prepare.isPending;
+  const editing =
+    curate.isPending ||
+    choose.isPending ||
+    prepare.isPending ||
+    saveCount.isPending;
   function editBest(id: number, add: boolean) {
     const ids = best.map((s) => s.candidate_id);
     curate.mutate(add ? [...ids, id] : ids.filter((value) => value !== id));
@@ -122,19 +144,60 @@ export function ScreenshotGallery({
     <div className="screenshot-review">
       <h2>Screenshot review</h2>
       <p>
-        Keep up to 15 best choices, remove any you do not want, or add
+        Keep up to 40 best choices, remove any you do not want, or add
         replacements from the full shortlist. Choose 1–15 final pairs. Both
         images in every pair must be B-frames. Frames reserved by the other
         codec, including nearby frames within the required spacing, cannot be
         selected.
       </p>
       {controls}
+      <section className="screenshot-best-settings">
+        <label>
+          Best screenshot candidates
+          <input
+            type="number"
+            min="2"
+            max="40"
+            step="1"
+            required
+            value={bestCount}
+            disabled={reviewing || editing}
+            onChange={(e) => {
+              setBestCount(Number(e.target.value));
+              saveCount.reset();
+            }}
+          />
+        </label>
+        <button
+          className="secondary"
+          disabled={reviewing || editing || !validCount || bestCount === target}
+          onClick={() => saveCount.mutate()}
+        >
+          {saveCount.isPending ? "Saving…" : "Save candidate count"}
+        </button>
+        <p className="muted">
+          Ask the agent for 2–40 best choices per encode, then choose your final
+          pairs (for example, 7). Save for the next review, or refresh below
+          using this count. Refresh reuses the saved shortlist and keeps
+          existing final images until you confirm replacements. Fewer choices
+          may be returned if fewer candidates remain eligible.
+        </p>
+        {reviewing && (
+          <p role="status">
+            The agent is reviewing screenshots. The count can be changed when it
+            finishes or is cancelled.
+          </p>
+        )}
+        {saveCount.isSuccess && (
+          <p role="status">Candidate count saved for the next review.</p>
+        )}
+      </section>
       {job.state === "WAITING_FOR_RELEASE_DETAILS" && (
-        <div className="callout">
+        <div className="callout needs-input">
           <h3>Your final screenshots are ready</h3>
           <p>
             Add the Chinese name, source, extra description, and tracker to
-            generate release files and upload your chosen pairs.
+            generate release files, with optional screenshot uploads.
           </p>
           <Link className="button" to={`/jobs/${job.id}/release`}>
             Continue to release →
@@ -148,7 +211,7 @@ export function ScreenshotGallery({
       >
         {(
           [
-            ["best", `Best ${best.length || 15}`],
+            ["best", `Best ${best.length || target}`],
             ["shortlist", `Shortlist (${shortlist.length})`],
             ["final", `Final (${final.length})`],
           ] as [View, string][]
@@ -168,18 +231,25 @@ export function ScreenshotGallery({
         job.state === "COMPLETE" &&
         shortlist.length > 0 && (
           <section>
-            <h3>Prepare the best 15 from your saved shortlist</h3>
+            <h3>Prepare the best {bestCount} from your saved shortlist</h3>
             <p>
               Your existing final images stay available. The agent will rank the
               saved shortlist and prepare comparison pairs for you to review.
             </p>
-            <button disabled={editing} onClick={() => prepare.mutate()}>
-              {prepare.isPending ? "Queuing review…" : "Prepare best 15"}
+            <button
+              disabled={editing || !validCount}
+              onClick={() => prepare.mutate()}
+            >
+              {prepare.isPending
+                ? "Queuing review…"
+                : `Prepare best ${bestCount}`}
             </button>
           </section>
         )}
-      {canChoose && (
-        <section className="screenshot-choice-bar">
+      {canChoose && view === "best" && (
+        <section
+          className={`screenshot-choice-bar ${job.state === "WAITING_FOR_SCREENSHOT_SELECTION" ? "needs-input" : ""}`}
+        >
           <div>
             <h3>{chosen.length} of up to 15 pairs chosen</h3>
             <p>
@@ -190,22 +260,27 @@ export function ScreenshotGallery({
           <div className="screenshot-actions">
             <button
               className="secondary"
-              disabled={editing}
+              disabled={editing || !validCount}
               onClick={() => prepare.mutate()}
             >
-              {prepare.isPending ? "Queuing review…" : "Refresh best 15"}
+              {prepare.isPending
+                ? "Queuing review…"
+                : `Refresh best ${bestCount}`}
             </button>
             <button
               className="secondary"
               disabled={editing}
               onClick={() => {
                 setDraft(
-                  best.filter((s) => !s.reservation).map((s) => s.candidate_id),
+                  best
+                    .filter((s) => !s.reservation)
+                    .slice(0, 15)
+                    .map((s) => s.candidate_id),
                 );
                 choose.reset();
               }}
             >
-              Choose all available
+              Choose up to 15 available
             </button>
             <button
               className="secondary"
@@ -228,7 +303,13 @@ export function ScreenshotGallery({
           </div>
         </section>
       )}
-      {[data.error, choose.error, prepare.error, curate.error].map(
+      {[
+        data.error,
+        choose.error,
+        prepare.error,
+        curate.error,
+        saveCount.error,
+      ].map(
         (error, index) =>
           error && (
             <p className="error" role="alert" key={index}>
@@ -254,7 +335,7 @@ export function ScreenshotGallery({
           </h3>
           <p>
             {job.state === "WAITING_FOR_SCREENSHOT_SELECTION"
-              ? "Open Best 15 to choose your final pairs."
+              ? "Open Best to choose your final pairs."
               : "Screenshot review follows validation and remuxing."}
           </p>
         </div>
@@ -313,13 +394,13 @@ export function ScreenshotGallery({
                   <button
                     className="secondary"
                     disabled={
-                      editing || best.length >= 15 || Boolean(shot.reservation)
+                      editing || best.length >= 40 || Boolean(shot.reservation)
                     }
                     aria-label={`Add candidate ${shot.candidate_id} to best`}
                     onClick={() => editBest(shot.candidate_id, true)}
                   >
-                    {best.length >= 15
-                      ? "Best list full (15/15)"
+                    {best.length >= 40
+                      ? "Best list full (40/40)"
                       : "Add to best"}
                   </button>
                 )}
@@ -403,7 +484,7 @@ export function ScreenshotGallery({
               Source PTS: {open.info.source_pts_seconds.toFixed(6)} seconds ·
               B-frames verified in both videos
             </small>
-            {canChoose && open.info.recommendation_rank && (
+            {canChoose && view === "best" && open.info.recommendation_rank && (
               <label className="screenshot-pick">
                 <input
                   type="checkbox"

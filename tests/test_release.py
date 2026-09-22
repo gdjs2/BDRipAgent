@@ -17,6 +17,7 @@ DETAILS = {
     "source": "1080p Blu-ray AVC DTS-HD MA 5.1-GROUP",
     "chinese_name": "电影中文名",
     "extra_description": "双语 · 内封字幕",
+    "movie_description": "",
     "tracker": "https://tracker.example/announce?passkey=private-key",
 }
 
@@ -183,8 +184,8 @@ def test_release_requires_the_entire_confirmed_rendered_selection(client, ready_
 
 
 def test_release_gate_cannot_be_skipped(client, new_job):
-    for method in (client.post, client.patch):
-        assert method(f"/api/jobs/{new_job['id']}/release", json=DETAILS).status_code == 409
+    assert client.post(f"/api/jobs/{new_job['id']}/release", json=DETAILS).status_code == 409
+    assert client.patch(f"/api/jobs/{new_job['id']}/release", json=DETAILS).status_code == 200
 
 
 def test_changed_details_clear_stale_release_results(client, ready_release):
@@ -208,6 +209,11 @@ def test_worker_uses_only_selected_pairs_and_registers_outputs(
 
     job = client.post(f"/api/jobs/{ready_release}/release", json=DETAILS).json()
     task_id = next(t["id"] for t in job["tasks"] if t["type"] == "generate_release")
+    from tests.test_source_sharing import peer
+
+    sibling = peer(client)
+    updated_details = {**DETAILS, "source": "Updated shared source description"}
+    assert client.patch(f"/api/jobs/{sibling['id']}/release", json=updated_details).status_code == 200
     requests = []
 
     def run(ctx, command, **kwargs):
@@ -377,3 +383,50 @@ def test_release_defaults_to_no_upload_and_rejects_coerced_booleans(client, read
     response = client.post(f"/api/jobs/{ready_release}/release", json=details)
     assert response.status_code == 202
     assert response.json()["analysis"]["release_details"]["upload_screenshots"] is False
+
+
+def test_movie_description_is_optional_and_preserves_bbcode_paragraphs(client, ready_release):
+    details = {
+        **DETAILS,
+        "movie_description": "[b]Movie description[/b]\n\nFirst paragraph.\nSecond paragraph.",
+    }
+    saved = client.patch(f"/api/jobs/{ready_release}/release", json=details)
+    assert saved.status_code == 200
+    assert saved.json()["analysis"]["release_details"]["movie_description"] == details["movie_description"]
+    legacy = {k: v for k, v in DETAILS.items() if k != "movie_description"}
+    assert (
+        client.patch(f"/api/jobs/{ready_release}/release", json=legacy).json()["analysis"]["release_details"][
+            "movie_description"
+        ]
+        == ""
+    )
+    for value in ("x" * 100001, "control\x00character"):
+        assert (
+            client.patch(
+                f"/api/jobs/{ready_release}/release", json={**DETAILS, "movie_description": value}
+            ).status_code
+            == 422
+        )
+
+
+def test_generation_rejects_stale_shared_release_revision(client, ready_release):
+    from tests.test_source_sharing import peer
+
+    original = client.patch(f"/api/jobs/{ready_release}/release", json=DETAILS).json()
+    revision = original["analysis"]["shared_release_details"]["revision"]
+    sibling = peer(client)
+    changed = {**DETAILS, "movie_description": "A newer shared description"}
+    assert client.patch(f"/api/jobs/{sibling['id']}/release", json=changed).status_code == 200
+    response = client.post(
+        f"/api/jobs/{ready_release}/release", json={**DETAILS, "shared_revision": revision}
+    )
+    assert response.status_code == 409
+    current = client.get(f"/api/jobs/{ready_release}").json()
+    assert current["state"] == "WAITING_FOR_RELEASE_DETAILS"
+    assert not any(task["type"] == "generate_release" for task in current["tasks"])
+    response = client.post(
+        f"/api/jobs/{ready_release}/release", json={**changed, "shared_revision": revision + 1}
+    )
+    assert response.status_code == 202
+    with session() as db:
+        assert db.get(MovieJob, ready_release).analysis["release_details"] == changed

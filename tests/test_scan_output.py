@@ -29,6 +29,7 @@ def test_analysis_keeps_scan_json_separate_from_diagnostics(new_job, environment
         if command[0] == environment.mkvmerge_bin:
             result = {
                 "tracks": [
+                    {"id": 0, "type": "video"},
                     {
                         "id": 4,
                         "type": "subtitles",
@@ -39,7 +40,7 @@ def test_analysis_keeps_scan_json_separate_from_diagnostics(new_job, environment
                             "track_name": "English SDH",
                             "flag_hearing_impaired": True,
                         },
-                    }
+                    },
                 ]
             }
         elif command[0] == environment.mediainfo_bin:
@@ -65,6 +66,7 @@ def test_analysis_keeps_scan_json_separate_from_diagnostics(new_job, environment
         analysis = media.analyze(ctx)
         assert analysis["crop"] == {"top": 104, "bottom": 104, "left": 0, "right": 0}
         subtitle = analysis["tracks"][0]
+        assert subtitle["source_order"] == 1
         assert subtitle["hearing_impaired"] is None
         assert subtitle["mux_name"] == "English PGS"
         assert subtitle["source_properties"]["flag_hearing_impaired"] is True

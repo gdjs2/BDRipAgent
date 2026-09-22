@@ -2,12 +2,12 @@ import json
 
 import pytest
 from sqlalchemy import select
+from worker.pipeline.release_migration import migrate
 
 from shared.db import session
 from shared.models import Artifact, MovieJob, Task
 from shared.paths import contained
 from tests.conftest import gate
-from worker.pipeline.release_migration import migrate
 
 
 def legacy(environment, new_job):

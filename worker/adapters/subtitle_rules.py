@@ -57,22 +57,10 @@ def decide(report, original_language):
             f"{len(simple)} distinct simplified and {len(traditional)} traditional forms; "
             f"{len(matches)} Cantonese markers in {len(matching_cues)} cues"
         )
-    elif (
-        len(readable) >= 6
-        and len(han) < 5
-        and original_language.lower().split("-")[0]
-        not in (
-            "zh",
-            "zho",
-            "chi",
-            "cmn",
-            "yue",
-            "und",
-        )
-    ):
-        language, script, confident = "other", "not_applicable", True
-        language_ids = [s["id"] for s in readable[:12]]
-        reasons.append("Readable non-Chinese dialogue; retaining the source language tag")
+    else:
+        # Shared scripts (Latin, Cyrillic, Arabic, etc.) do not identify a
+        # language. Source tags are OCR hints, never evidence of the language.
+        reasons.append("Written language needs visual content review; source language is unverified")
 
     # Brackets or a music symbol alone can mean translation, signs, or lyrics.
     # Require repeated explicit non-dialogue sound descriptions for a positive rule.
@@ -93,6 +81,11 @@ def decide(report, original_language):
     )
     return SubtitleDecision(
         language=language,
+        language_code=(
+            ("yue" if language == "cantonese" else "zh") + ("-Hans" if script == "simplified" else "-Hant")
+            if confident
+            else "und"
+        ),
         script=script,
         language_confident=confident,
         hearing_impaired=sdh,

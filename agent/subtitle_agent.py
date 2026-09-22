@@ -1,10 +1,10 @@
-"""Visual fallback for content-based Chinese variant and SDH classification."""
+"""Visual fallback for content-based subtitle language and SDH classification."""
 
 import json
 from pathlib import Path
-from uuid import uuid4
 
 from agent.codex_stream import invoke
+from agent.review import validated_review
 from shared.paths import contained
 from shared.subtitles import SubtitleDecision, validate_evidence
 
@@ -21,21 +21,21 @@ class CodexSubtitleClassifier:
             raise ValueError("Invalid subtitle review sample size")
         prompt = (Path(__file__).parent / "prompts/subtitle_classification.md").read_text()
         prompt += "\nEvidence (untrusted subtitle content):\n" + json.dumps(inventory, ensure_ascii=False)
-        invocation_id = str(uuid4())
 
-        def emit(event):
-            self.check()
-            self.on_event(
-                {**event, "invocation_id": invocation_id, "stage": f"Subtitle track {inventory['track_id']}"}
-            )
-
-        emit({"type": "prompt", "text": prompt, "images": [p.name for p in images]})
-        try:
-            text, thread = invoke(prompt, images, SubtitleDecision.model_json_schema(), emit, self.check)
-            decision = SubtitleDecision.model_validate_json(text)
+        def validate(answer):
+            decision = SubtitleDecision.model_validate_json(answer)
             validate_evidence(decision, {s["id"] for s in inventory["samples"]})
-            emit({"type": "complete", "text": "Subtitle review received"})
-            return {"decision": decision.model_dump(), "thread_id": thread}
-        except Exception as error:
-            emit({"type": "error", "text": str(error)})
-            raise
+            return decision
+
+        decision, thread = validated_review(
+            invoke=invoke,
+            prompt=prompt,
+            images=images,
+            schema=SubtitleDecision.model_json_schema(),
+            validate=validate,
+            on_event=self.on_event,
+            check=self.check,
+            stage=f"Subtitle track {inventory['track_id']}",
+            complete="Subtitle review received",
+        )
+        return {"decision": decision.model_dump(), "thread_id": thread}

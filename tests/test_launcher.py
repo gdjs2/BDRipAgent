@@ -32,6 +32,13 @@ from dotenv import dotenv_values
 args = sys.argv[1:]
 with open(os.environ['FAKE_DOCKER_LOG'], 'a') as log:
     log.write(json.dumps(args) + '\\n')
+if args[:2] == ['update', '--restart=no']:
+    assert args[-1] == 'existing-worker'
+    sys.exit(0)
+if args[:3] == ['inspect', '--format', '{{.Config.Hostname}}']:
+    assert args[-1] == 'existing-encoder'
+    print('encoder-container-host')
+    sys.exit(0)
 if args == ['info']:
     sys.exit(int(os.environ.get('FAKE_INFO_ERROR', '0')))
 if args == ['compose', 'version']:
@@ -45,14 +52,26 @@ if 'config' in args:
     values.update({key: os.environ[key] for key in values if key in os.environ})
     for key, value in values.items():
         print(f'{key}={value or ""}')
+elif 'ps' in args:
+    service = args[-1]
+    if os.environ.get('FAKE_' + service.upper() + '_EXISTS'):
+        print('existing-' + service)
+elif 'stop' in args:
+    assert args[-1] == 'general-upgrade'
+    sys.exit(0)
+elif 'build' in args:
+    sys.exit(0)
 elif 'up' in args:
-    assert '--wait' in args and '--build' in args
+    assert '--wait' in args
     sys.exit(int(os.environ.get('FAKE_UP_ERROR', '0')))
 elif 'run' in args:
     assert args[-4:] == ['-m', 'worker.pipeline.release_migration', '--legacy-torrents', '/legacy-torrents']
     assert '--no-deps' in args and '--rm' in args
     sys.exit(int(os.environ.get('FAKE_MIGRATION_ERROR', '0')))
 elif 'exec' in args:
+    if '-c' in args:
+        print(os.environ.get('FAKE_WORKER_STATE' if 'worker' in args else 'FAKE_ENCODER_STATE', 'ready'))
+        sys.exit(0)
     if args[-2:] == ['login', 'status']:
         sys.exit(0 if os.environ.get('FAKE_LOGGED_IN') else 1)
     raise AssertionError('Noninteractive tests must never request browser authentication')
@@ -116,7 +135,7 @@ def test_repeat_start_does_not_rotate_credentials_or_change_custom_settings(laun
     assert (project / ".env").read_bytes() == original
     assert "already authenticated" in result.stdout
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert sum("up" in cmd for cmd in commands) == 2
+    assert sum("up" in cmd for cmd in commands) == 6
 
 
 def test_storage_quotes_shell_overrides_and_env_data_are_handled_safely(launcher):
@@ -192,3 +211,40 @@ def test_startup_relocates_legacy_exports_and_removes_only_empty_torrent_directo
     (torrents / "unrelated.txt").write_text("keep")
     assert run("--no-login").returncode == 0
     assert (torrents / "unrelated.txt").read_text() == "keep"
+
+
+def test_application_updates_preserve_existing_encoder_and_active_legacy_worker(launcher):
+    _, run, log = launcher
+    result = run("--no-login", FAKE_ENCODER_EXISTS="1", FAKE_WORKER_EXISTS="1", FAKE_WORKER_STATE="busy")
+    assert result.returncode == 0, result.stderr
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert not any("build" in cmd and "encoder" in cmd for cmd in commands)
+    assert not any("up" in cmd and "worker" in cmd for cmd in commands)
+    encoder = next(cmd for cmd in commands if "up" in cmd and "encoder" in cmd)
+    assert "--no-recreate" in encoder and "--no-deps" in encoder
+    assert "encodes continue uninterrupted" in result.stdout
+    assert any("up" in cmd and "general-upgrade" in cmd for cmd in commands)
+    assert any("cancel_consumer" in " ".join(cmd) for cmd in commands)
+
+
+def test_idle_legacy_worker_can_switch_to_general_queue(launcher):
+    _, run, log = launcher
+    result = run("--no-login", FAKE_ENCODER_EXISTS="1", FAKE_WORKER_EXISTS="1")
+    assert result.returncode == 0, result.stderr
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert any("up" in cmd and "worker" in cmd for cmd in commands)
+    assert not any("build" in cmd and "encoder" in cmd for cmd in commands)
+
+
+def test_encoder_update_requires_paused_queue_and_no_active_encodes(launcher):
+    _, run, log = launcher
+    result = run("--no-login", "--update-encoder", FAKE_ENCODER_EXISTS="1", FAKE_ENCODER_STATE="busy")
+    assert result.returncode != 0
+    assert "Pause the queue" in result.stderr
+    assert not any("up" in json.loads(line) for line in log.read_text().splitlines())
+    result = run("--no-login", "--update-encoder", FAKE_ENCODER_EXISTS="1")
+    assert result.returncode == 0, result.stderr
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    encoder = next(cmd for cmd in commands if "up" in cmd and "encoder" in cmd)
+    assert "--no-recreate" not in encoder and "--no-deps" in encoder
+    assert any("build" in cmd and "encoder" in cmd for cmd in commands)

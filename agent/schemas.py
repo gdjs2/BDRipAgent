@@ -24,8 +24,8 @@ class Selection(BaseModel):
 
 
 def review_policy(policy: ScreenshotPolicy, available: int) -> ScreenshotPolicy:
-    """The agent proposes fifteen diverse choices; the user decides the final count."""
-    count = min(15, available)
+    """The agent proposes the requested review count; the user chooses the final set."""
+    count = min(policy.best_count, available)
     if count < 2:
         raise ValueError("Not enough candidates for screenshot review")
     representative = round(count * policy.representative / policy.count)

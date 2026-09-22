@@ -117,7 +117,8 @@ def test_sparse_scan_stops_at_target_and_preserves_exact_b_frame_numbers(
         assert int(frames[index].pict_type) == 3
         assert candidate["picture_type"] == candidate["encoded_picture_type"] == "B"
         assert candidate["b_frames_verified"]
-    values = [r["value"] for r in ctx.reports]
+    assert ctx.reports[0]["value"] is None  # Index preparation has no measured completion yet.
+    values = [r["value"] for r in ctx.reports if r["value"] is not None]
     assert values == sorted(values)
 
 

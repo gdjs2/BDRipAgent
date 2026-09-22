@@ -1,7 +1,7 @@
 import asyncio
 import json
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
@@ -14,8 +14,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app import queue
+from backend.app.agent_activity import router as agent_activity_router
 from backend.app.auth import authenticated, issue_cookie
+from backend.app.cpu_monitor import CpuMonitor
+from backend.app.media_preview import MediaPreview
+from backend.app.media_preview import router as media_preview_router
 from backend.app.movie_metadata import IMDbLookupError, job_identity, lookup_imdb
+from backend.app.release_defaults import (
+    analysis_with_release_defaults,
+    seed_existing_release_details,
+    store_release_details,
+)
 from backend.app.schemas import (
     CreateJob,
     CreatePair,
@@ -23,31 +32,44 @@ from backend.app.schemas import (
     HoldTask,
     Login,
     OrderQueue,
-    ReleaseDetails,
     ReleaseSource,
     ReplaceScreenshot,
+    ReviewScreenshots,
+    SaveReleaseDetails,
     SelectEncode,
+    SelectScreenshotBestCount,
     SelectScreenshotDecoder,
     SelectScreenshots,
     SelectTracks,
     UpdateQueue,
 )
-from backend.app.services import advance, enqueue, event, get_job, job_detail, manifest, reconcile, serialize
+from backend.app.services import (
+    advance,
+    enqueue,
+    event,
+    get_job,
+    job_detail,
+    manifest,
+    reconcile,
+    serialize,
+    serialize_tracks,
+)
+from backend.app.track_choices import apply_shared_choices, source_peers, store_choices, track_rows
 from shared.config import ScreenshotPolicy, behavior, get_settings, profiles
 from shared.db import get_db, session
+from shared.encoding import EncodeTarget, is_smoke_test
 from shared.models import (
     Artifact,
     CRFResult,
     EncodeConfig,
     Event,
     MovieJob,
-    MovieTrack,
     Screenshot,
     Task,
     TrackSelection,
     now,
 )
-from shared.naming import release_name, source_description, track_name
+from shared.naming import release_name, source_description
 from shared.paths import artifact_root, contained, job_dir
 from shared.screenshot_rules import (
     check_manual_spacing,
@@ -56,8 +78,8 @@ from shared.screenshot_rules import (
     other_variant_frames,
     reservation_for,
 )
-from shared.state import Stage, require_stage
-from shared.tracks import FLAG_NAMES
+from shared.state import STAGES, TRACK_EDIT_STAGES, Stage, require_stage
+from shared.subtitle_discovery import DiscoveryPolicy
 
 DB = Annotated[Session, Depends(get_db)]
 
@@ -67,12 +89,27 @@ async def lifespan(app):
     if len(get_settings().api_token) < 24:
         raise RuntimeError("API_TOKEN must contain at least 24 characters")
     with session() as db:
+        queue.settings(db, lock=True)
+        seed_existing_release_details(db)
         reconcile(db)
         queue.settings(db)
         db.commit()
         for job in db.scalars(select(MovieJob).where(MovieJob.deleted_at.is_(None))):
             manifest(db, job)
-    yield
+    app.state.media_preview = MediaPreview()
+    monitor = CpuMonitor(
+        get_settings().cpu_stat_path, get_settings().cpu_loadavg_path, get_settings().cpu_info_path
+    )
+    monitor.sample()
+    app.state.cpu_monitor = monitor
+    sampling = asyncio.create_task(monitor.run())
+    try:
+        yield
+    finally:
+        await app.state.media_preview.close()
+        sampling.cancel()
+        with suppress(asyncio.CancelledError):
+            await sampling
 
 
 app = FastAPI(title="BDRip Agent", lifespan=lifespan)
@@ -131,12 +168,22 @@ def configuration():
     return {
         "profiles": profiles(),
         "screenshots": behavior()["screenshots"],
-        "stages": list(Stage),
+        "stages": STAGES,
+        "audio_review": {
+            "max_rounds": max(
+                1, min(30, int(behavior()["integrations"].get("audio_review", {}).get("max_rounds", 6)))
+            )
+        },
         "release": {
             "upload_host": "TTG",
             "upload_configured": bool(get_settings().tu_ttg_token.get_secret_value().strip()),
         },
     }
+
+
+@api.get("/system/cpu")
+def cpu_usage(request: Request):
+    return request.app.state.cpu_monitor.snapshot()
 
 
 @api.get("/queue")
@@ -147,10 +194,14 @@ def queue_status(db: DB):
 @api.patch("/queue")
 def update_queue(body: UpdateQueue, db: DB):
     config = queue.settings(db, lock=True)
-    if body.max_concurrent_jobs is not None:
-        if body.max_concurrent_jobs > get_settings().worker_capacity:
-            raise ValueError(f"This worker supports up to {get_settings().worker_capacity} simultaneous jobs")
-        config.max_concurrent_jobs = body.max_concurrent_jobs
+    for field in ("max_encoding_tasks", "max_crf_tasks", "max_other_tasks"):
+        value = getattr(body, field)
+        if value is not None:
+            if value > get_settings().worker_capacity:
+                raise ValueError(
+                    f"Each queue limit must be at most the worker capacity ({get_settings().worker_capacity} tasks)"
+                )
+            setattr(config, field, value)
     if body.paused is not None:
         config.paused = body.paused
     db.commit()
@@ -226,6 +277,15 @@ def initialize_job(body: CreateJob, db, identity):
         release_name=release_name(
             identity["title"], identity["year"], profiles()[body.analysis_profile]["codec"]
         ),
+        analysis={
+            "subtitle_discovery_policy": body.subtitle_discovery.model_dump(),
+            "audio_review_policy": {
+                "max_rounds": body.audio_review_max_rounds
+                or max(
+                    1, min(30, int(behavior()["integrations"].get("audio_review", {}).get("max_rounds", 6)))
+                )
+            },
+        },
         analysis_profile=body.analysis_profile,
         screenshot_policy=policy.model_dump(),
     )
@@ -309,74 +369,137 @@ def delete_job(job_id: UUID, db: DB, confirm: str):
 
 @api.get("/jobs/{job_id}/analysis")
 def analysis(job_id: UUID, db: DB):
-    return get_job(db, str(job_id)).analysis
+    return analysis_with_release_defaults(db, get_job(db, str(job_id)))
 
 
 @api.get("/jobs/{job_id}/tracks")
 def tracks(job_id: UUID, db: DB):
-    get_job(db, str(job_id))
-    return [serialize(t) for t in db.scalars(select(MovieTrack).where(MovieTrack.job_id == str(job_id)))]
+    return serialize_tracks(db, get_job(db, str(job_id)))
+
+
+@api.get("/languages/verify")
+def verify_language(code: str):
+    from shared.languages import language_tag
+    from shared.naming import language_name
+
+    canonical = language_tag(code.strip())
+    return {"code": canonical, "language_name": language_name(canonical)}
+
+
+@api.post("/jobs/{job_id}/tracks/upload", status_code=201)
+async def upload_subtitle(job_id: UUID, request: Request, filename: str, code: str, hearing_impaired: bool):
+    from backend.app.subtitle_uploads import receive_upload
+
+    return await receive_upload(request, str(job_id), filename, code, hearing_impaired)
+
+
+@api.get("/jobs/{job_id}/tracks/{track_id}/download")
+def download_track(job_id: UUID, track_id: int, db: DB, variant: str = "track"):
+    from backend.app.track_downloads import track_download
+
+    if variant not in ("track", "original", "cleaned"):
+        raise ValueError("Unknown track download version")
+    return track_download(db, get_job(db, str(job_id)), track_id, variant)
+
+
+@api.get("/jobs/{job_id}/subtitles/uploads/{upload_id}/download")
+def download_subtitle_upload(job_id: UUID, upload_id: UUID, db: DB):
+    from backend.app.track_downloads import uploaded_original
+
+    return uploaded_original(db, get_job(db, str(job_id)), str(upload_id))
+
+
+@api.get("/jobs/{job_id}/tracks/{track_id}/language")
+def verify_track_language(job_id: UUID, track_id: int, code: str, db: DB):
+    from shared.languages import language_tag
+    from shared.naming import automatic_track_name, language_name
+
+    job = get_job(db, str(job_id))
+    row = track_rows(db, job).get(track_id)
+    if row is None:
+        raise LookupError("Track not found")
+    canonical = language_tag(code.strip())
+    info = {**row.info, "kind": row.kind, "language": canonical}
+    return {
+        "code": canonical,
+        "language_name": language_name(canonical),
+        "track_name": automatic_track_name(info),
+        "base_name": automatic_track_name({**info, "forced": False, "hearing_impaired": False}),
+    }
+
+
+@api.delete("/jobs/{job_id}/subtitles/discovered/{track_id}")
+def remove_discovered_subtitle(job_id: UUID, track_id: int, db: DB):
+    from backend.app.subtitle_removal import remove_discovered
+
+    job = remove_discovered(db, str(job_id), track_id)
+    manifest(db, job)
+    return job_detail(db, job)
+
+
+@api.post("/jobs/{job_id}/subtitles/discover", status_code=202)
+def discover_subtitles(job_id: UUID, body: DiscoveryPolicy, db: DB):
+    from backend.app.subtitle_discovery import request_discovery
+
+    queue.settings(db, lock=True)
+    job = get_job(db, str(job_id), lock=True)
+    request_discovery(db, job, body)
+    db.commit()
+    return job_detail(db, job)
 
 
 @api.post("/jobs/{job_id}/tracks/analyze", status_code=202)
 def analyze_tracks(job_id: UUID, db: DB):
+    from backend.app.services import ensure_track_analysis
+
     job = get_job(db, str(job_id), lock=True)
-    require_stage(job.state, Stage.WAITING_FOR_TRACK_SELECTION)
-    if db.scalar(select(Task).where(Task.job_id == job.id, Task.status.in_(["QUEUED", "RUNNING"]))):
-        raise ValueError("Wait for the active task before analyzing subtitles")
     if db.scalar(select(TrackSelection).where(TrackSelection.job_id == job.id)):
         raise ValueError("Tracks have already been selected")
-    job.state = Stage.ANALYZING_SOURCE.value
-    event(db, job.id, "state_changed", state=job.state)
-    enqueue(db, job)
+    if job.state not in TRACK_EDIT_STAGES | {Stage.ANALYZING_SOURCE}:
+        raise ValueError("Track analysis is no longer available at this stage")
+    ensure_track_analysis(db, job)
     db.commit()
-    manifest(db, job)
     return job_detail(db, job)
 
 
 @api.post("/jobs/{job_id}/tracks/selection")
 def select_tracks(job_id: UUID, body: SelectTracks, db: DB):
+    queue.settings(db, lock=True)
     job = get_job(db, str(job_id), lock=True)
-    require_stage(job.state, Stage.WAITING_FOR_TRACK_SELECTION)
-    tracks = {t.track_id: t for t in db.scalars(select(MovieTrack).where(MovieTrack.job_id == job.id))}
-    for track_id in body.audio_track_ids:
-        if track_id not in tracks or tracks[track_id].kind != "audio":
-            raise ValueError(f"Invalid audio track {track_id}")
-        if not tracks[track_id].info.get("extractable"):
-            raise ValueError(f"Audio codec on track {track_id} is not supported for native extraction")
-    for track_id in body.subtitle_track_ids:
-        if track_id not in tracks or tracks[track_id].info.get("codec_id") != "S_HDMV/PGS":
-            raise ValueError(f"Track {track_id} is not a PGS subtitle")
-    chosen = set(body.audio_track_ids + body.subtitle_track_ids)
-    updated = {}
-    for track_id in chosen:
-        track = tracks[track_id]
-        info = {**track.info}
-        if track_id in body.track_names:
-            info["name_override"] = body.track_names[track_id]
-        if track_id in body.track_flags:
-            flags = {**info.get("flag_overrides", {}), **body.track_flags[track_id]}
-            info.update(flags)
-            info["flag_overrides"] = flags
-        if info.get("track_review", {}).get("schema_version") == 1:
-            unresolved = [flag for flag in FLAG_NAMES if not isinstance(info.get(flag), bool)]
-            if unresolved:
-                raise ValueError(
-                    f"Track {track_id}: choose unresolved flags before continuing: {', '.join(unresolved)}"
-                )
-        if track_id in body.track_names or track_id in body.track_flags:
-            info["mux_name"] = track_name({**info, "kind": track.kind})
-        track.info = info
-        updated[track_id] = info
-    job.analysis = {
-        **job.analysis,
-        "tracks": [
-            {**track, **updated.get(track["track_id"], {})} for track in job.analysis.get("tracks", [])
-        ],
-    }
-    db.add(TrackSelection(job_id=job.id, **body.model_dump(exclude={"track_names", "track_flags"})))
-    advance(db, job)
+    if job.state not in TRACK_EDIT_STAGES:
+        raise ValueError("Track choices are locked once preparation for remux starts")
+    if db.scalar(
+        select(Task.id).where(
+            Task.job_id == job.id, Task.lane == "tracks", Task.status.in_(["QUEUED", "RUNNING"])
+        )
+    ):
+        raise ValueError("Wait for track review to finish before confirming tracks")
+    record = store_choices(db, job, body)
+    changed = [job]
+    peers = db.scalars(
+        select(MovieJob)
+        .where(*source_peers(job), MovieJob.id != job.id)
+        .order_by(MovieJob.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    for peer in peers:
+        if apply_shared_choices(db, peer, record):
+            changed.append(peer)
+    for current in changed:
+        if current.state == Stage.WAITING_FOR_TRACK_SELECTION:
+            advance(db, current)
     db.commit()
+    for current in changed:
+        manifest(db, current)
+    return job_detail(db, job)
+
+
+@api.post("/jobs/{job_id}/remux", status_code=202)
+def remux(job_id: UUID, body: SelectTracks, db: DB):
+    from backend.app.remux import request_remux
+
+    job = request_remux(db, str(job_id), body)
     manifest(db, job)
     return job_detail(db, job)
 
@@ -417,14 +540,67 @@ def select_encode(job_id: UUID, body: SelectEncode, db: DB):
     return job_detail(db, job)
 
 
+@api.patch("/jobs/{job_id}/encode-selection")
+def update_encode_target(job_id: UUID, body: EncodeTarget, db: DB):
+    # Match worker admission lock order: a queued encode either sees the new
+    # target or starts first and makes the edit fail, never a partially changed target.
+    queue.settings(db, lock=True)
+    job = get_job(db, str(job_id), lock=True)
+    require_stage(job.state, Stage.ENCODING)
+    task = db.scalar(
+        select(Task)
+        .where(Task.job_id == job.id, Task.type == "encode")
+        .order_by(Task.created_at.desc(), Task.id.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if not task or task.status not in ("QUEUED", "CANCELLED", "FAILED"):
+        raise ValueError(
+            "The encode has started. Cancel it and wait for it to stop before changing its target."
+        )
+    config = db.scalar(select(EncodeConfig).where(EncodeConfig.job_id == job.id))
+    if not config or is_smoke_test(job) or config.data.get("execution_mode") == "smoke":
+        raise ValueError("This job has no editable encoding target")
+    profile = config.data["profile_snapshot"]
+    if body.rate_control == "crf" and not profile["crf_min"] <= body.crf <= profile["crf_max"]:
+        raise ValueError("CRF is outside profile limits")
+    previous = {
+        key: config.data[key] for key in ("rate_control", "crf", "bitrate_kbps") if key in config.data
+    }
+    target = body.model_dump(exclude_none=True)
+    config.data = {
+        **{
+            key: value
+            for key, value in config.data.items()
+            if key not in ("rate_control", "crf", "bitrate_kbps")
+        },
+        **target,
+        "selected_by": "user",
+        "selected_at": now().isoformat(),
+    }
+    event(db, job.id, "encode_target_updated", task_id=task.id, previous=previous, target=target)
+    db.commit()
+    manifest(db, job)
+    return job_detail(db, job)
+
+
+@api.post("/jobs/{job_id}/reencode", status_code=202)
+def reencode(job_id: UUID, body: EncodeTarget, db: DB):
+    from backend.app.reencode import request as request_reencode
+
+    job = request_reencode(db, str(job_id), body)
+    manifest(db, job)
+    return job_detail(db, job)
+
+
 @api.post("/jobs/{job_id}/smoke-test")
 def start_smoke_test(job_id: UUID, db: DB):
     job = get_job(db, str(job_id), lock=True)
     require_stage(job.state, Stage.WAITING_FOR_ENCODE_SELECTION)
     result = db.scalar(select(CRFResult).where(CRFResult.job_id == job.id))
     profile = result.data.get("profile_snapshot") if result else None
-    if not profile or "prepared_tracks" not in job.analysis or not job.analysis.get("video"):
-        raise ValueError("Complete source analysis, track preparation and CRF analysis first")
+    if not profile or not job.analysis.get("video"):
+        raise ValueError("Complete source and CRF analysis first")
     db.add(
         EncodeConfig(
             job_id=job.id,
@@ -533,6 +709,24 @@ def screenshot_decoder(job_id: UUID, body: SelectScreenshotDecoder, db: DB):
     return job_detail(db, job)
 
 
+@api.patch("/jobs/{job_id}/screenshots/best-count")
+def screenshot_best_count(job_id: UUID, body: SelectScreenshotBestCount, db: DB):
+    job = get_job(db, str(job_id), lock=True)
+    if db.scalar(
+        select(Task.id).where(
+            Task.job_id == job.id, Task.type == "select_screenshots", Task.status == "RUNNING"
+        )
+    ):
+        raise ValueError(
+            "Screenshot review is running. Wait for it to finish or cancel it before changing the count."
+        )
+    job.screenshot_policy = {**job.screenshot_policy, "best_count": body.best_count}
+    event(db, job.id, "screenshot_best_count_updated", best_count=body.best_count)
+    db.commit()
+    manifest(db, job)
+    return job_detail(db, job)
+
+
 @api.post("/jobs/{job_id}/screenshots/selection")
 def choose_screenshots(job_id: UUID, body: SelectScreenshots, db: DB):
     job = get_job(db, str(job_id), lock=True)
@@ -609,7 +803,7 @@ def curate_screenshots(job_id: UUID, body: CurateScreenshots, db: DB):
 
 
 @api.post("/jobs/{job_id}/screenshots/review", status_code=202)
-def prepare_screenshot_review(job_id: UUID, db: DB):
+def prepare_screenshot_review(job_id: UUID, db: DB, body: ReviewScreenshots | None = None):
     job = get_job(db, str(job_id), lock=True)
     if job.state not in (
         Stage.WAITING_FOR_SCREENSHOT_SELECTION,
@@ -626,6 +820,8 @@ def prepare_screenshot_review(job_id: UUID, db: DB):
     )
     if not ids:
         raise ValueError("This job has no saved shortlist to review")
+    if body and body.best_count is not None:
+        job.screenshot_policy = {**job.screenshot_policy, "best_count": body.best_count}
     job.analysis = {**job.analysis, "review_shortlisted_ids": ids}
     job.state, job.completed_at = Stage.SCREENSHOT_AGENT_SELECTION.value, None
     event(db, job.id, "state_changed", state=job.state, review_requested=True)
@@ -693,7 +889,15 @@ def convert_source_description(body: ReleaseSource):
     return ReleaseSource(source=source_description(body.source)).model_dump()
 
 
-def editable_release(db, job):
+def editable_release(db, job, *, generating=False):
+    if not generating:
+        if db.scalar(
+            select(Task.id).where(
+                Task.job_id == job.id, Task.type == "generate_release", Task.status.in_(["QUEUED", "RUNNING"])
+            )
+        ):
+            raise ValueError("Wait for release generation to finish before editing its details")
+        return
     if job.state not in (Stage.WAITING_FOR_RELEASE_DETAILS, Stage.GENERATING_RELEASE, Stage.COMPLETE):
         raise ValueError("Choose and render your final screenshots before preparing the release")
     if db.scalar(select(Task.id).where(Task.job_id == job.id, Task.status.in_(["QUEUED", "RUNNING"]))):
@@ -701,34 +905,31 @@ def editable_release(db, job):
 
 
 @api.patch("/jobs/{job_id}/release")
-def save_release_details(job_id: UUID, body: ReleaseDetails, db: DB):
+def save_release_details(job_id: UUID, body: SaveReleaseDetails, db: DB):
+    queue.settings(db, lock=True)
     job = get_job(db, str(job_id), lock=True)
     editable_release(db, job)
-    analysis = dict(job.analysis)
-    if analysis.get("release_details") != body.model_dump():
-        analysis.pop("release_result", None)
-    job.analysis = {**analysis, "release_details": body.model_dump()}
-    event(db, job.id, "release_details_saved")
+    record = store_release_details(db, job, body)
+    event(db, job.id, "release_details_saved", shared_revision=record.revision)
     db.commit()
     manifest(db, job)
     return job_detail(db, job)
 
 
 @api.post("/jobs/{job_id}/release", status_code=202)
-def generate_release(job_id: UUID, body: ReleaseDetails, db: DB):
+def generate_release(job_id: UUID, body: SaveReleaseDetails, db: DB):
     from shared.release import selected_pairs
 
+    queue.settings(db, lock=True)
     job = get_job(db, str(job_id), lock=True)
-    editable_release(db, job)
+    editable_release(db, job, generating=True)
     selected_pairs(db, job, get_settings())
     if body.upload_screenshots and not get_settings().tu_ttg_token.get_secret_value().strip():
         raise ValueError(
             "Set TU_TTG_TOKEN in .env and restart the API and worker to enable screenshot uploads"
         )
-    job.analysis = {
-        **{k: v for k, v in job.analysis.items() if k != "release_result"},
-        "release_details": body.model_dump(),
-    }
+    store_release_details(db, job, body)
+    job.analysis = {k: v for k, v in job.analysis.items() if k != "release_result"}
     job.state, job.completed_at = Stage.GENERATING_RELEASE.value, None
     event(db, job.id, "state_changed", state=job.state)
     enqueue(db, job)
@@ -761,19 +962,32 @@ def task(task_id: UUID, db: DB):
 
 @api.post("/tasks/{task_id}/retry", status_code=202)
 def retry(task_id: UUID, db: DB):
+    queue.settings(db, lock=True)
     task = get_task(db, task_id)
     job = get_job(db, task.job_id, lock=True)
     db.refresh(task)
-    if task.status not in ["FAILED", "CANCELLED"] or job.state != task.stage:
+    from backend.app.services import task_is_current
+
+    if task.status not in ["FAILED", "CANCELLED"] or not task_is_current(job, task):
         raise ValueError("Only failed/cancelled tasks at the current stage can be retried")
     newest = db.scalar(
         select(Task)
-        .where(Task.job_id == job.id, Task.stage == job.state)
+        .where(Task.job_id == job.id, Task.stage == task.stage)
         .order_by(Task.created_at.desc())
         .limit(1)
     )
     if newest.id != task.id:
         raise ValueError("Retry the latest attempt")
+    if task.type == "review_uploaded_subtitle":
+        from backend.app.subtitle_uploads import upload_allowed
+
+        upload_allowed(db, job)
+        if db.scalar(
+            select(Task.id)
+            .join(MovieJob, MovieJob.id == Task.job_id)
+            .where(*source_peers(job), Task.lane == "tracks", Task.status.in_(["QUEUED", "RUNNING"]))
+        ):
+            raise ValueError("Wait for the current subtitle search or review to finish")
     result = enqueue(db, job, retry_of=task)
     db.commit()
     return serialize(result)
@@ -892,13 +1106,26 @@ async def agent_events(task_id: UUID, request: Request, db: DB):
     )
 
 
+@api.get("/jobs/{job_id}/encoder-info")
+def encoder_info(job_id: UUID, db: DB):
+    from backend.app.encode_summary import summary
+
+    return summary(db, get_job(db, str(job_id)))
+
+
 @api.get("/artifacts/{artifact_id}/preview")
 def artifact_preview(artifact_id: UUID, db: DB):
     item = db.get(Artifact, str(artifact_id))
     if not item:
         raise LookupError("Artifact not found")
     get_job(db, item.job_id)
-    if item.artifact_type not in ("RELEASE_BBCODE", "RELEASE_NFO", "RELEASE_MD5", "RELEASE_ENCODER_INFO"):
+    if item.artifact_type not in (
+        "RELEASE_BBCODE",
+        "RELEASE_NFO",
+        "RELEASE_MD5",
+        "RELEASE_ENCODER_INFO",
+        "ENCODER_INFO",
+    ):
         raise ValueError("This artifact is not a release text file")
     root = artifact_root(get_settings(), item.job_id, item.storage)
     path = contained(root, item.path, exists=True)
@@ -972,4 +1199,6 @@ async def events(job_id: UUID, request: Request, db: DB):
     )
 
 
+api.include_router(media_preview_router)
+api.include_router(agent_activity_router)
 app.include_router(api)

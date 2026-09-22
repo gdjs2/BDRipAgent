@@ -12,7 +12,10 @@ from worker.pipeline.release_exports import publish, release_paths
 
 def context(settings, name="Movie.2026.1080p.BluRay.x264-WiKi"):
     return SimpleNamespace(
-        settings=settings, job=SimpleNamespace(id=str(uuid4()), release_name=name), check=lambda: None
+        settings=settings,
+        job=SimpleNamespace(id=str(uuid4()), release_name=name),
+        check=lambda: None,
+        progress=lambda *a, **kw: None,
     )
 
 

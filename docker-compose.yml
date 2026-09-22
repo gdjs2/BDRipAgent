@@ -9,6 +9,7 @@ x-app-env: &app-env
   API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env}
   AGENT_TOKEN: ${AGENT_TOKEN:?Set AGENT_TOKEN in .env}
   WORKER_CAPACITY: ${WORKER_CAPACITY:-8}
+  OUTPUT_BACKUP_DAYS: ${OUTPUT_BACKUP_DAYS:-3}
 
 services:
   frontend:
@@ -28,10 +29,16 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       <<: *app-env
+      CPU_STAT_PATH: /host/proc/stat
+      CPU_LOADAVG_PATH: /host/proc/loadavg
+      CPU_INFO_PATH: /host/proc/cpuinfo
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       IMDB_TIMEOUT_SECONDS: ${IMDB_TIMEOUT_SECONDS:-25}
       TU_TTG_TOKEN: ${TU_TTG_TOKEN:-}
     volumes:
+      - /proc/stat:/host/proc/stat:ro
+      - /proc/loadavg:/host/proc/loadavg:ro
+      - /proc/cpuinfo:/host/proc/cpuinfo:ro
       - ${STORAGE_ROOT:-./data}/incoming:/source:ro
       - ${STORAGE_ROOT:-./data}/jobs:/workspace
       - ${STORAGE_ROOT:-./data}/completed:/completed:ro
@@ -50,14 +57,15 @@ services:
       retries: 10
     restart: unless-stopped
 
-  worker:
+  worker: &media-worker
     build:
       context: .
       dockerfile: worker/Dockerfile
     init: true
-    command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--autoscale=${WORKER_CAPACITY:-8},1']
+    command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--queues=bdrip.other', '--hostname=general@%h', '--autoscale=${WORKER_CAPACITY:-8},1']
     environment:
       <<: *app-env
+      WORKER_POOL: other
       AGENT_URL: http://agent:8001
       TU_TTG_TOKEN: ${TU_TTG_TOKEN:-}
     volumes:
@@ -75,6 +83,38 @@ services:
         condition: service_healthy
     stop_grace_period: 30s
     restart: unless-stopped
+
+  general-upgrade:
+    <<: *media-worker
+    # Temporary bridge while a pre-split worker finishes its existing encodes.
+    profiles: [legacy-upgrade]
+    command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--queues=bdrip.other,celery', '--hostname=general-upgrade@%h', '--autoscale=${WORKER_CAPACITY:-8},1']
+
+  encoder:
+    <<: *media-worker
+    # A separate image/service lets application updates preserve active encodes.
+    command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--queues=bdrip.encoding', '--hostname=encoder@%h', '--autoscale=${WORKER_CAPACITY:-8},1']
+    environment:
+      <<: *app-env
+      WORKER_POOL: encoding
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 24h
+
+  crf:
+    <<: *media-worker
+    command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--queues=bdrip.crf', '--hostname=crf@%h', '--autoscale=${WORKER_CAPACITY:-8},1']
+    environment:
+      <<: *app-env
+      WORKER_POOL: crf
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   agent:
     build:

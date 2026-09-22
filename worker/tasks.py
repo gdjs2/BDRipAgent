@@ -1,6 +1,7 @@
 import logging
 import socket
 import threading
+import time
 import traceback
 from datetime import timedelta
 from uuid import uuid4
@@ -10,7 +11,8 @@ from celery.signals import worker_process_init, worker_ready
 from sqlalchemy import select
 
 from backend.app import queue
-from backend.app.services import advance, event, get_job, manifest, reconcile
+from backend.app.services import advance, event, get_job, manifest, reconcile, task_is_current
+from backend.app.track_choices import apply_shared_choices
 from shared.config import get_settings
 from shared.db import session
 from shared.models import MovieJob, Task, now
@@ -24,6 +26,7 @@ celery.conf.update(
     task_ignore_result=True,
     broker_connection_retry_on_startup=True,
     broker_transport_options={"visibility_timeout": 604800},
+    task_default_queue="bdrip.other",
 )
 
 
@@ -49,18 +52,27 @@ def dispatch():
                 seconds=60
             ):
                 continue
-            execute.apply_async(args=[task.id], task_id=task.id)
+            execute.apply_async(args=[task.id], task_id=task.id, queue=f"bdrip.{queue.task_pool(task)}")
             task.dispatched_at = now()
         db.commit()
 
 
 @worker_ready.connect
 def ready(**kwargs):
+    if get_settings().worker_pool in ("encoding", "crf"):
+        return  # The general worker owns dispatch; specialized workers only execute their queue.
+
     # Runs in the worker parent, so an hours-long encode cannot starve dispatch/recovery.
     def loop():
+        last_cleanup = 0
         while True:
             try:
                 dispatch()
+                if time.monotonic() - last_cleanup >= 3600:
+                    from worker.output_backups import cleanup_expired_outputs
+
+                    cleanup_expired_outputs()
+                    last_cleanup = time.monotonic()
             except Exception:
                 logging.getLogger(__name__).exception("Queue dispatch failed; will retry")
             threading.Event().wait(10)
@@ -80,13 +92,26 @@ def execute(task_id):
         task = db.get(Task, task_id)
         if not task:
             return
+        pool = get_settings().worker_pool
+        if pool != "all" and pool != queue.task_pool(task):
+            # Fence incorrect/legacy deliveries before claiming a lease.
+            delivery = execute.request.delivery_info or {}
+            if task.status == "QUEUED" and delivery.get("routing_key") == "celery":
+                # During a legacy worker drain, relay its old default-queue
+                # deliveries to the dedicated encoder without taking a lease.
+                execute.apply_async(args=[task.id], task_id=task.id, queue=f"bdrip.{queue.task_pool(task)}")
+                task.dispatched_at = now()
+            else:
+                task.dispatched_at = None
+            db.commit()
+            return
         job = db.scalar(
             select(MovieJob)
             .where(MovieJob.id == task.job_id, MovieJob.deleted_at.is_(None))
             .with_for_update()
         )
         db.refresh(task)
-        if not job or task.status != "QUEUED" or job.state != task.stage:
+        if not job or task.status != "QUEUED" or not task_is_current(job, task):
             return
         if task.id not in {t.id for t in queue.available(db, config)}:
             task.dispatched_at = None
@@ -115,7 +140,14 @@ def execute(task_id):
             task.can_pause, task.pause_requested, task.paused_at = False, False, None
             event(db, job.id, "task_completed", task_id=task_id)
             db.flush()  # Release unique active-task slot before creating the next task.
-            advance(db, job)
+            if task.type == "review_tracks":
+                from backend.app.subtitle_discovery import ensure_discovery
+
+                ensure_discovery(db, job)
+            if task.lane == "pipeline":
+                advance(db, job)
+            elif apply_shared_choices(db, job) and job.state == "WAITING_FOR_TRACK_SELECTION":
+                advance(db, job)
             db.commit()
             manifest(db, job)
     except Exception as error:

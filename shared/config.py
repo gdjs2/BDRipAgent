@@ -33,16 +33,23 @@ class Settings(BaseSettings):
     ffmpeg_bin: str = "ffmpeg"
     crf_studio_bin: str = "/opt/crf-studio/.venv/bin/bdrip"
     sup2sup_bin: str = "/opt/sup2sup/.venv/bin/sup2sup"
+    subtitleedit_bin: str = "/opt/subtitleedit/seconv"
     audio_review_python: str = "/opt/audio-review/bin/python"
     bdrip_python: str = "/opt/crf-studio/.venv/bin/python"
     tu_ttg_token: SecretStr = SecretStr("")
     codex_bin: str = "codex"
     imdb_timeout_seconds: float = Field(default=25, ge=1, le=55)
+    worker_pool: Literal["all", "encoding", "crf", "other"] = "all"
+    cpu_stat_path: Path = Path("/proc/stat")
+    cpu_loadavg_path: Path = Path("/proc/loadavg")
+    cpu_info_path: Path = Path("/proc/cpuinfo")
+    output_backup_days: int = Field(default=3, ge=0, le=3650)
     worker_capacity: int = Field(default=8, ge=1, le=64)
 
 
 class ScreenshotPolicy(BaseModel):
     decoder: ScreenshotDecoder = "cuda"
+    best_count: int = Field(default=15, ge=2, le=40, strict=True)
     count: int = Field(default=7, ge=2, le=30)
     representative: int = Field(default=4, ge=0)
     encode_challenging: int = Field(default=3, ge=0)

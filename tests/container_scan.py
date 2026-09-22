@@ -38,7 +38,7 @@ def main():
             execute(task_id)
             job = client.get(f"/api/jobs/{created['id']}").json()
             assert job["tasks"][0]["status"] == "SUCCEEDED", job["tasks"]
-            assert job["state"] == "WAITING_FOR_TRACK_SELECTION", job["state"]
+            assert job["state"] == "RUNNING_CRF_ANALYSIS", job["state"]
             video = job["analysis"]["video"]
             crop = Crop(**job["analysis"]["crop"])
             scan_path = settings.workspace_root / job["id"] / "metadata" / task_id / "handbrake-scan.txt"

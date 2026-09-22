@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from langcodes import Language
 from PIL import Image, ImageDraw, ImageOps
 
 
@@ -114,6 +115,33 @@ def sheets(directory, samples):
     return names
 
 
+def ocr_languages(hint, available):
+    """Use metadata only to choose OCR models; the agent verifies original images."""
+    try:
+        language = Language.get(hint)
+        base = language.language
+        if base in ("zh", "yue"):
+            preferred = ["chi_tra", "chi_sim"]
+        elif base == "sr" and language.script == "Latn":
+            preferred = ["srp_latn"]
+        elif base == "az" and language.script == "Cyrl":
+            preferred = ["aze_cyrl"]
+        elif base == "uz" and language.script == "Cyrl":
+            preferred = ["uzb_cyrl"]
+        else:
+            preferred = [language.to_alpha3()]
+    except (ValueError, LookupError):
+        preferred = []
+    selected = [name for name in preferred if name in available]
+    if not selected:
+        selected = [name for name in ("chi_tra", "chi_sim") if name in available]
+    if "eng" in available and "eng" not in selected:
+        selected.append("eng")
+    if not selected:
+        raise ValueError("No usable Tesseract OCR models are installed")
+    return "+".join(selected)
+
+
 def scan(source, directory, limit, language):
     from sup2sup.pgs.parser import parse_sup
 
@@ -135,12 +163,12 @@ def scan(source, directory, limit, language):
     count = min(limit, len(unique))
     indices = [round(i * (len(unique) - 1) / max(1, count - 1)) for i in range(count)]
     simple, traditional = script_forms(directory)
-    base_language = language.lower().split("-")[0]
-    primary = (
-        "jpn+eng"
-        if base_language in ("ja", "jpn")
-        else ("kor+eng" if base_language in ("ko", "kor") else "chi_tra+chi_sim+eng")
+    available = set(
+        subprocess.run(
+            ["tesseract", "--list-langs"], check=True, capture_output=True, text=True, timeout=30
+        ).stdout.splitlines()[1:]
     )
+    primary = ocr_languages(language, available)
     samples = []
     for done, index in enumerate(indices, 1):
         number, cue = unique[index]
@@ -154,7 +182,9 @@ def scan(source, directory, limit, language):
         ocr_path = directory / "ocr-input.png"
         ImageOps.invert(picture.convert("RGB")).save(ocr_path)
         readings = [ocr(ocr_path, primary)]
-        if any(c in simple or c in traditional for c in readings[0]["text"]):
+        if {"chi_sim", "chi_tra", "eng"} <= available and any(
+            c in simple or c in traditional for c in readings[0]["text"]
+        ):
             readings.append(ocr(ocr_path, "chi_sim+chi_tra+eng"))
         best = max(readings, key=lambda value: value["confidence"])
 
@@ -183,6 +213,7 @@ def scan(source, directory, limit, language):
         "unique_cues": len(unique),
         "sampled_cues": len(samples),
         "sampling": "uniform across distinct bitmap cues",
+        "ocr_languages": primary,
         "samples": samples,
         "contact_sheets": sheets(directory, samples),
     }

@@ -1,4 +1,12 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { AgentLive } from "./AgentLive";
+import { EncoderSummary } from "./EncoderSummary";
+import { JobStatus } from "./JobStatus";
+import { CpuMonitor } from "./CpuMonitor";
+import { taskProgress } from "./task-progress";
+import { Tracks } from "./Tracks";
+import { automaticLogTask, failedTasks, taskPage } from "./job-status";
+import { Artifacts } from "./Artifacts";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
   QueryClient,
@@ -14,10 +22,12 @@ import {
   Route,
   Routes,
   useNavigate,
+  useLocation,
   useParams,
 } from "react-router-dom";
-import type { TrackFlag } from "./types";
 import { EncodingConfiguration } from "./EncodingConfiguration";
+import { EncodeTargetEditor } from "./EncodeTargetEditor";
+import { editableEncodingTask } from "./encoding-configuration";
 import { EncodingPauseButton } from "./EncodingPauseButton";
 import { encodingPauseState } from "./encoding-pause";
 import { AgentTranscript } from "./AgentTranscript";
@@ -96,6 +106,7 @@ function App() {
         </NavLink>
         <NavLink to="/new">＋ &nbsp; New movie job</NavLink>
         <NavLink to="/queue">☷ &nbsp; Queue</NavLink>
+        <NavLink to="/agent">✦ &nbsp; Agent Live</NavLink>
         <div className="sidebar-foot">
           <i /> Self-hosted encoding
           <br />
@@ -119,12 +130,14 @@ function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/new" element={<NewJob config={config.data} />} />
           <Route path="/queue" element={<QueuePage />} />
+          <Route path="/agent" element={<AgentLive />} />
           <Route
             path="/jobs/:id/*"
             element={<JobPage config={config.data} />}
           />
         </Routes>
       </main>
+      <CpuMonitor />
     </>
   );
 }
@@ -171,8 +184,14 @@ function Dashboard() {
     refetchInterval: 5000,
   });
   const data = jobs.data ?? [];
-  const waiting = data.filter((j) => j.state.startsWith("WAITING"));
-  const failed = data.filter((j) => latestTask(j)?.status === "FAILED");
+  const waiting = data.filter(
+    (j) =>
+      j.state.startsWith("WAITING") ||
+      (j.tracks_editable &&
+        j.track_analysis_complete &&
+        (!j.track_selection || j.subtitle_discovery?.review_required)),
+  );
+  const failed = data.flatMap(failedTasks);
   return (
     <>
       <header>
@@ -192,7 +211,10 @@ function Dashboard() {
           ["Completed", data.filter((j) => j.state === "COMPLETE").length],
           ["Failed tasks", failed.length],
         ].map(([label, count]) => (
-          <div className="stat" key={label}>
+          <div
+            className={`stat ${["Waiting for input", "Failed tasks"].includes(String(label)) && Number(count) > 0 ? "needs-input" : ""}`}
+            key={label}
+          >
             <span>{label}</span>
             <strong>{count}</strong>
           </div>
@@ -221,9 +243,13 @@ function Dashboard() {
                   {j.analysis_profile} · {j.source_path}
                 </span>
               </Link>
-              <Badge>{j.state}</Badge>
+              <JobStatus job={j} />
               {j.analysis.smoke_test && <Badge>SMOKE TEST</Badge>}
-              {latestTask(j)?.status === "FAILED" && <Badge>FAILED</Badge>}
+              {failedTasks(j).length > 0 && <Badge>NEEDS ATTENTION</Badge>}
+              {!j.state.startsWith("WAITING") &&
+                j.tracks_editable &&
+                j.track_analysis_complete &&
+                !j.track_selection && <Badge>TRACK SELECTION NEEDED</Badge>}
               <RemoveJob job={j} />
             </div>
           ))
@@ -257,11 +283,36 @@ function NewJob({ config }: { config: Config }) {
   const [source, setSource] = useState(""),
     [title, setTitle] = useState(""),
     [year, setYear] = useState("");
-  const [paired, setPaired] = useState(true);
+  // Prefer live-action profiles independently for each codec. Config keys are
+  // alphabetically sorted by the API, which otherwise puts animation first.
+  const profileNames = Object.keys(config.profiles).sort((a, b) => {
+    const rank = (name: string) =>
+      name.endsWith("-live")
+        ? 0
+        : config.profiles[name].tune === "animation"
+          ? 2
+          : 1;
+    return rank(a) - rank(b) || a.localeCompare(b);
+  });
+  const firstProfile =
+    profileNames.find((name) => config.profiles[name].codec === "x265") ??
+    profileNames[0] ??
+    "";
+  const otherProfile =
+    profileNames.find(
+      (name) =>
+        config.profiles[name].codec !== config.profiles[firstProfile]?.codec,
+    ) ?? "";
+  const [paired, setPaired] = useState(Boolean(otherProfile));
+  const [audioRounds, setAudioRounds] = useState(
+    config.audio_review?.max_rounds ?? 6,
+  );
+  const [findSubtitles, setFindSubtitles] = useState(false);
+  const [originalLanguages, setOriginalLanguages] = useState("");
   const [imdbId, setImdbId] = useState("");
   const [movie, setMovie] = useState<IMDbMovie | null>(null);
-  const [secondProfile, setSecondProfile] = useState("x264-live");
-  const [profile, setProfile] = useState("x265-live"),
+  const [secondProfile, setSecondProfile] = useState(otherProfile);
+  const [profile, setProfile] = useState(firstProfile),
     [policy, setPolicy] = useState(config.screenshots);
   const navigate = useNavigate();
   const lookup = useMutation({
@@ -280,8 +331,8 @@ function NewJob({ config }: { config: Config }) {
     (option) => option.title === title,
   );
   const previewCodecs = paired
-    ? [config.profiles[profile].codec, config.profiles[secondProfile].codec]
-    : [config.profiles[profile].codec];
+    ? [config.profiles[profile]?.codec, config.profiles[secondProfile]?.codec]
+    : [config.profiles[profile]?.codec];
   const create = useMutation({
     mutationFn: () =>
       api<Job | Job[]>(paired ? "/jobs/pair" : "/jobs", {
@@ -292,6 +343,11 @@ function NewJob({ config }: { config: Config }) {
         ...(paired ? { second_profile: secondProfile } : {}),
         analysis_profile: profile,
         screenshot_policy: policy,
+        audio_review_max_rounds: audioRounds,
+        subtitle_discovery: {
+          enabled: findSubtitles,
+          original_languages: originalLanguages.split(/[,\s]+/).filter(Boolean),
+        },
       }),
     onSuccess: (result) =>
       navigate(Array.isArray(result) ? "/" : `/jobs/${result.id}`),
@@ -439,14 +495,18 @@ function NewJob({ config }: { config: Config }) {
             <label>
               Analysis & encode profile
               <select
+                aria-label="Analysis & encode profile"
                 value={profile}
                 onChange={(e) => {
                   setProfile(e.target.value);
                   const codec = config.profiles[e.target.value].codec;
-                  setSecondProfile(
-                    Object.keys(config.profiles).find(
-                      (name) => config.profiles[name].codec !== codec,
-                    )!,
+                  setSecondProfile((current) =>
+                    config.profiles[current] &&
+                    config.profiles[current].codec !== codec
+                      ? current
+                      : (profileNames.find(
+                          (name) => config.profiles[name].codec !== codec,
+                        ) ?? ""),
                   );
                 }}
               >
@@ -461,6 +521,7 @@ function NewJob({ config }: { config: Config }) {
               <input
                 type="checkbox"
                 checked={paired}
+                disabled={!otherProfile}
                 onChange={(e) => setPaired(e.target.checked)}
               />
               Create both x264 and x265 encodes
@@ -469,12 +530,13 @@ function NewJob({ config }: { config: Config }) {
               <label>
                 Second encode profile
                 <select
+                  aria-label="Second encode profile"
                   value={secondProfile}
                   onChange={(e) => setSecondProfile(e.target.value)}
                 >
                   {Object.entries(config.profiles)
                     .filter(
-                      ([, p]) => p.codec !== config.profiles[profile].codec,
+                      ([, p]) => p.codec !== config.profiles[profile]?.codec,
                     )
                     .map(([name, p]) => (
                       <option key={name} value={name}>
@@ -485,11 +547,76 @@ function NewJob({ config }: { config: Config }) {
               </label>
             )}
             <p className="muted">
-              WiKi filenames and MKV titles are generated from the movie title,
-              year, codec and selected audio. Each encode has seven comparison
-              frames, spaced at least {policy.min_spacing_seconds} seconds from
-              the other encode's frames.
+              WiKi filenames use the movie title, year, codec and selected
+              audio. The MKV title is Movie Name (Year). Each encode has seven
+              comparison frames, spaced at least {policy.min_spacing_seconds}{" "}
+              seconds from the other encode's frames.
             </p>
+            <fieldset className="subtitle-discovery-options">
+              <legend>Missing subtitles</legend>
+              <label className="track">
+                <input
+                  type="checkbox"
+                  checked={findSubtitles}
+                  onChange={(e) => setFindSubtitles(e.target.checked)}
+                />
+                Find missing subtitles during analysis
+              </label>
+              <p className="muted">
+                Search for missing original-language, English, Simplified
+                Chinese, and Traditional Chinese subtitles. The agent aligns
+                them against source subtitles, checks them, and prepares PGS
+                tracks for your review.
+              </p>
+              {findSubtitles && (
+                <label>
+                  Original language codes (optional)
+                  <input
+                    value={originalLanguages}
+                    onChange={(e) => setOriginalLanguages(e.target.value)}
+                    placeholder="e.g. ko or ja,en"
+                  />
+                  <small>
+                    Leave blank for the agent to verify the movie’s original
+                    languages online. Dubbed audio is not used to guess them.
+                  </small>
+                </label>
+              )}
+            </fieldset>
+            <label>
+              Audio analysis maximum rounds
+              <input
+                type="number"
+                required
+                min="1"
+                max="30"
+                step="1"
+                value={audioRounds}
+                onChange={(e) => setAudioRounds(Number(e.target.value))}
+              />
+              <small>
+                The agent stops earlier when differences are clear. At this
+                limit, unresolved differences are summarized for your review.
+              </small>
+            </label>
+            <label>
+              Best screenshot candidates
+              <input
+                type="number"
+                required
+                min="2"
+                max="40"
+                step="1"
+                value={policy.best_count ?? 20}
+                onChange={(e) =>
+                  setPolicy({ ...policy, best_count: Number(e.target.value) })
+                }
+              />
+              <small>
+                Agent recommendations per encode, before you choose the final
+                pairs. For example, review 20 and choose 7 for each codec.
+              </small>
+            </label>
             <label>
               Representative frames (remaining frames show encoding challenges)
               <input
@@ -539,6 +666,8 @@ function NewJob({ config }: { config: Config }) {
             <button
               disabled={
                 !source ||
+                !config.profiles[profile] ||
+                (paired && !config.profiles[secondProfile]) ||
                 create.isPending ||
                 lookup.isPending ||
                 (imdbActive && !movie)
@@ -555,6 +684,8 @@ function NewJob({ config }: { config: Config }) {
 }
 
 function JobPage({ config }: { config: Config }) {
+  const tabNav = useRef<HTMLElement>(null);
+  const { pathname } = useLocation();
   const { id } = useParams(),
     query = useQueryClient();
   const job = useQuery({
@@ -584,6 +715,8 @@ function JobPage({ config }: { config: Config }) {
     [
       "ready",
       "state_changed",
+      "tracks_selected",
+      "release_details_saved",
       "task_started",
       "task_pause_requested",
       "task_pause_available",
@@ -593,6 +726,7 @@ function JobPage({ config }: { config: Config }) {
       "task_progress",
       "task_failed",
       "task_completed",
+      "tracks_updated",
       "artifact_created",
       "screenshot_best_updated",
       "screenshot_decoder_selected",
@@ -602,10 +736,32 @@ function JobPage({ config }: { config: Config }) {
       window.clearTimeout(refreshTimer);
     };
   }, [id, query]);
+  useEffect(() => {
+    const nav = tabNav.current;
+    const active = nav?.querySelector<HTMLElement>('[aria-current="page"]');
+    if (nav && active)
+      nav.scrollLeft +=
+        active.getBoundingClientRect().left -
+        nav.getBoundingClientRect().left -
+        12;
+  }, [pathname, job.data?.id]);
   if (job.error && (!job.data || !isConnectionError(job.error)))
     return <ErrorBox error={job.error} />;
   if (!job.data) return <div className="loading">Loading job…</div>;
   const j = job.data;
+  const inputTabs = new Set(failedTasks(j).map((task) => taskPage(task.type)));
+  const manualPage: Record<string, string> = {
+    WAITING_FOR_TRACK_SELECTION: "tracks",
+    WAITING_FOR_ENCODE_SELECTION: "crf",
+    WAITING_FOR_SCREENSHOT_SELECTION: "screenshots",
+    WAITING_FOR_RELEASE_DETAILS: "release",
+  };
+  if (manualPage[j.state]) inputTabs.add(manualPage[j.state]);
+  const needsTracks =
+    j.tracks_editable &&
+    j.track_analysis_complete &&
+    (!j.track_selection || j.subtitle_discovery?.review_required);
+  if (needsTracks) inputTabs.add("tracks");
   return (
     <>
       <Link className="back" to="/">
@@ -631,7 +787,13 @@ function JobPage({ config }: { config: Config }) {
             </a>
           )}
         </div>
-        <Badge>{j.state}</Badge>
+        <div className="job-status-badges">
+          <Badge>{j.analysis_profile}</Badge>
+          <JobStatus job={j} />
+          {needsTracks && !j.state.startsWith("WAITING") && (
+            <Badge>TRACK SELECTION NEEDED</Badge>
+          )}
+        </div>
       </header>
       {j.analysis.smoke_test && (
         <div className="callout" role="status">
@@ -643,7 +805,7 @@ function JobPage({ config }: { config: Config }) {
           </p>
         </div>
       )}
-      <nav className="tabs">
+      <nav className="tabs" ref={tabNav} aria-label="Job pages">
         {[
           ["", "Overview"],
           ["tracks", "Tracks"],
@@ -653,7 +815,15 @@ function JobPage({ config }: { config: Config }) {
           ["release", "Release"],
           ["artifacts", "Artifacts & logs"],
         ].map(([path, label]) => (
-          <NavLink key={path} end={path === ""} to={`/jobs/${id}/${path}`}>
+          <NavLink
+            key={path}
+            end={path === ""}
+            to={`/jobs/${id}/${path}`}
+            className={({ isActive }) =>
+              `${isActive ? "active" : ""} ${inputTabs.has(path) ? "needs-input" : ""}`
+            }
+            title={inputTabs.has(path) ? "Your input is needed" : undefined}
+          >
             {label}
           </NavLink>
         ))}
@@ -690,491 +860,213 @@ function JobPage({ config }: { config: Config }) {
 function Overview({ job, stages }: { job: Job; stages: string[] }) {
   const index = stages.indexOf(job.state),
     video = job.analysis.video;
+  const review = latestTask({
+    ...job,
+    tasks: job.tasks.filter((t) => t.type === "review_tracks"),
+  });
+  const stopped = review && ["FAILED", "CANCELLED"].includes(review.status);
+  const active = job.tasks.filter((t) =>
+    ["QUEUED", "RUNNING"].includes(t.status),
+  );
   return (
-    <>
-      <div className="two-column">
-        <section>
-          <h2>Workflow</h2>
-          <div className="timeline">
-            {stages
-              .filter((s) => s !== "NEW")
-              .map((s) => (
-                <div
-                  key={s}
-                  className={
-                    s === job.state
-                      ? "current"
-                      : stages.indexOf(s) < index
-                        ? "done"
-                        : ""
-                  }
-                >
-                  <b>
-                    {stages.indexOf(s) < index
-                      ? "✓"
-                      : s === job.state
-                        ? "●"
-                        : "○"}
-                  </b>
-                  {readable(s)}
-                </div>
-              ))}
-          </div>
-        </section>
-        <div>
-          {job.state === "WAITING_FOR_TRACK_SELECTION" && (
-            <Callout to="tracks" title="Choose the tracks to preserve">
-              Review audio and PGS subtitles to continue.
+    <div className="overview-layout">
+      <div className="overview-main">
+        {active.map((task) => (
+          <TaskCard key={task.id} task={task} />
+        ))}
+        {failedTasks(job).map((task) => (
+          <TaskCard key={task.id} task={task} />
+        ))}
+        {((job.tracks_editable && !job.track_selection) ||
+          job.state === "WAITING_FOR_TRACK_SELECTION") && (
+          <Callout
+            to="tracks"
+            title={
+              stopped
+                ? "Track review needs attention"
+                : job.track_analysis_complete
+                  ? "Choose the tracks to preserve"
+                  : "Tracks are being reviewed"
+            }
+            label={
+              stopped
+                ? "REVIEW STOPPED"
+                : job.track_analysis_complete
+                  ? "YOUR INPUT IS NEEDED"
+                  : "IN PROGRESS"
+            }
+          >
+            {stopped
+              ? "Track review stopped. Open Tracks to inspect the error and retry; video processing can continue."
+              : job.track_analysis_complete
+                ? "Audio comparisons and subtitle descriptions are ready. Confirm your tracks before remuxing."
+                : "Audio and subtitle review runs alongside CRF analysis and encoding. Descriptions appear as they finish."}
+          </Callout>
+        )}
+        {job.state === "WAITING_FOR_ENCODE_SELECTION" && (
+          <Callout to="crf" title="Your encode decision is ready">
+            Choose a CRF or two-pass bitrate to start encoding.
+          </Callout>
+        )}
+        {job.state === "WAITING_FOR_SCREENSHOT_SELECTION" && (
+          <Callout to="screenshots" title="Choose your final screenshots">
+            Review the recommendations and choose 1–15 comparison pairs.
+          </Callout>
+        )}
+        {job.state === "WAITING_FOR_RELEASE_DETAILS" && (
+          <Callout to="release" title="Add your release details">
+            Confirm your release details to generate the local files, with
+            optional screenshot uploads.
+          </Callout>
+        )}
+        {job.state !== "COMPLETE" &&
+          job.state !== "WAITING_FOR_RELEASE_DETAILS" && (
+            <Callout
+              to="release"
+              title={
+                job.analysis.release_details
+                  ? "Release draft saved"
+                  : "Prepare release details anytime"
+              }
+              label="AVAILABLE ANYTIME"
+            >
+              Save or edit release details while video processing runs.
             </Callout>
           )}
-          {job.state === "WAITING_FOR_ENCODE_SELECTION" && (
-            <Callout to="crf" title="Your encode decision is ready">
-              Choose a CRF, a two-pass bitrate, or run a downstream smoke test.
-            </Callout>
-          )}
-          {job.state === "WAITING_FOR_SCREENSHOT_SELECTION" && (
-            <Callout to="screenshots" title="Choose your final screenshots">
-              Review the best 15 and choose 1–15 comparison pairs.
-            </Callout>
-          )}
-          {job.state === "WAITING_FOR_RELEASE_DETAILS" && (
-            <Callout to="release" title="Add your release details">
-              Enter the Chinese name, source, extra description, and tracker to
-              generate release files, with optional screenshot uploads.
-            </Callout>
-          )}
-          <section>
-            <h2>Source details</h2>
-            {video ? (
-              <>
-                <div className="metrics">
-                  <div>
-                    <small>VIDEO</small>
-                    <strong>
-                      {video.codec.toUpperCase()} · {video.bit_depth}-bit
-                    </strong>
-                  </div>
-                  <div>
-                    <small>RESOLUTION</small>
-                    <strong>
-                      {video.width} × {video.height}
-                    </strong>
-                  </div>
-                  <div>
-                    <small>FRAME RATE</small>
-                    <strong>{video.fps}</strong>
-                  </div>
-                  <div>
-                    <small>DURATION</small>
-                    <strong>{clock(video.duration)}</strong>
-                  </div>
-                </div>
-                <h3>HandBrake crop</h3>
-                <div className="crop">
-                  {Object.entries(job.analysis.crop ?? {}).map(([k, v]) => (
-                    <div key={k}>
-                      <small>{k}</small>
-                      <strong>{v}px</strong>
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <p className="muted">Source analysis is queued or running.</p>
-            )}
-          </section>
-          {latestTask(job) && <TaskCard task={latestTask(job)!} />}
-        </div>
+        {job.state === "COMPLETE" && (
+          <Callout to="release" title="Your release is ready" label="COMPLETE">
+            Preview the generated text and download the torrent from Release.
+          </Callout>
+        )}
       </div>
-    </>
+      <div>
+        <section className="workflow-panel">
+          <h2>Workflow</h2>
+          <div className="workflow-status">
+            <span>Video pipeline</span>
+            <Badge>{job.state}</Badge>
+          </div>
+          <div className="workflow-status">
+            <span>Track selection</span>
+            <Badge>
+              {job.track_selection
+                ? "CONFIRMED"
+                : job.track_analysis_complete
+                  ? "READY TO SELECT"
+                  : stopped
+                    ? "STOPPED"
+                    : (review?.status ?? "PENDING")}
+            </Badge>
+          </div>
+          <div className="workflow-status">
+            <span>Release details</span>
+            <Badge>
+              {job.analysis.release_details ? "SAVED" : "NOT FILLED"}
+            </Badge>
+          </div>
+          <details className="workflow-details">
+            <summary>All workflow steps</summary>
+            <div className="timeline">
+              {stages
+                .filter((s) => s !== "NEW")
+                .map((s) => (
+                  <div
+                    key={s}
+                    className={
+                      s === job.state
+                        ? `current ${s.startsWith("WAITING_FOR_") ? "needs-input" : ""}`
+                        : stages.indexOf(s) < index
+                          ? "done"
+                          : ""
+                    }
+                  >
+                    <b>
+                      {stages.indexOf(s) < index
+                        ? "✓"
+                        : s === job.state
+                          ? "●"
+                          : "○"}
+                    </b>
+                    {readable(s)}
+                  </div>
+                ))}
+            </div>
+          </details>
+        </section>
+        <section>
+          <h2>Source details</h2>
+          {video ? (
+            <>
+              <div className="metrics">
+                <div>
+                  <small>VIDEO</small>
+                  <strong>
+                    {video.codec.toUpperCase()} · {video.bit_depth}-bit
+                  </strong>
+                </div>
+                <div>
+                  <small>RESOLUTION</small>
+                  <strong>
+                    {video.width} × {video.height}
+                  </strong>
+                </div>
+                <div>
+                  <small>FRAME RATE</small>
+                  <strong>{video.fps}</strong>
+                </div>
+                <div>
+                  <small>VIDEO BITRATE</small>
+                  <strong>
+                    {video.bit_rate
+                      ? `${(video.bit_rate / 1000000).toFixed(2)} Mbps`
+                      : "Not reported"}
+                  </strong>
+                </div>
+                <div>
+                  <small>DURATION</small>
+                  <strong>{clock(video.duration)}</strong>
+                </div>
+              </div>
+              <h3>HandBrake crop</h3>
+              <div className="crop">
+                {Object.entries(job.analysis.crop ?? {}).map(([k, v]) => (
+                  <div key={k}>
+                    <small>{k}</small>
+                    <strong>{v}px</strong>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="muted">Source analysis is queued or running.</p>
+          )}
+        </section>
+      </div>
+    </div>
   );
 }
 function Callout({
   to,
   title,
   children,
+  label = "YOUR INPUT IS NEEDED",
 }: {
   to: string;
   title: string;
   children: ReactNode;
+  label?: string;
 }) {
   return (
-    <div className="callout">
-      <small>YOUR INPUT IS NEEDED</small>
+    <div
+      className={`callout ${["YOUR INPUT IS NEEDED", "REVIEW STOPPED"].includes(label) ? "needs-input" : ""}`}
+    >
+      <small>{label}</small>
       <h2>{title}</h2>
       <p>{children}</p>
       <Link className="button" to={to}>
         Review & continue →
       </Link>
     </div>
-  );
-}
-
-function Tracks({ job }: { job: Job }) {
-  const query = useQueryClient();
-  const [audio, setAudio] = useState<number[]>(
-    job.track_selection?.audio_track_ids ?? [],
-  );
-  const [subs, setSubs] = useState<number[]>(
-    job.track_selection?.subtitle_track_ids ?? [],
-  );
-  const [names, setNames] = useState<Record<number, string>>({});
-  const [flags, setFlags] = useState<
-    Record<number, Partial<Record<TrackFlag, boolean>>>
-  >({});
-  const flagLabels: [TrackFlag, string][] = [
-    ["default", "Default"],
-    ["forced", "Forced"],
-    ["hearing_impaired", "SDH / hearing impaired"],
-    ["visual_impaired", "Audio description"],
-    ["commentary", "Commentary"],
-  ];
-  const waiting = job.state === "WAITING_FOR_TRACK_SELECTION";
-  const subtitles = job.tracks.filter(
-    (t) => t.kind === "subtitles" && t.info.extractable,
-  );
-  const needsAnalysis =
-    job.tracks.length > 0 &&
-    (job.analysis.track_review_version !== 1 ||
-      subtitles.some((t) => t.info.subtitle_detection?.schema_version !== 1));
-  const inconclusive = subtitles.some(
-    (t) => t.info.subtitle_detection?.status === "inconclusive",
-  );
-  const analyze = useMutation({
-    mutationFn: () => api(`/jobs/${job.id}/tracks/analyze`, {}),
-    onSuccess: () => query.invalidateQueries({ queryKey: ["job", job.id] }),
-  });
-  const enabled = waiting && !needsAnalysis && !analyze.isPending;
-  const save = useMutation({
-    mutationFn: () =>
-      api(`/jobs/${job.id}/tracks/selection`, {
-        audio_track_ids: audio,
-        subtitle_track_ids: subs,
-        track_flags: Object.fromEntries(
-          Object.entries(flags).filter(([id]) =>
-            [...audio, ...subs].includes(Number(id)),
-          ),
-        ),
-        track_names: Object.fromEntries(
-          Object.entries(names).filter(([id]) =>
-            [...audio, ...subs].includes(Number(id)),
-          ),
-        ),
-      }),
-    onSuccess: () => query.invalidateQueries({ queryKey: ["job", job.id] }),
-  });
-  const invalidNames = [...audio, ...subs].some(
-    (id) => names[id] !== undefined && !names[id].trim(),
-  );
-  const unresolvedFlags = job.tracks.some(
-    (t) =>
-      [...audio, ...subs].includes(t.track_id) &&
-      flagLabels.some(
-        ([key]) => (flags[t.track_id]?.[key] ?? t.info[key]) == null,
-      ),
-  );
-  const toggle = (list: number[], n: number) =>
-    list.includes(n) ? list.filter((x) => x !== n) : [...list, n];
-  const activeAnalysis = job.tasks.find(
-    (t) => t.type === "analyze" && ["QUEUED", "RUNNING"].includes(t.status),
-  );
-  return (
-    <>
-      <div className="section-heading">
-        <div>
-          <h2>Review descriptions and choose tracks</h2>
-          <p>
-            PGS subtitles are checked before selection for Chinese script,
-            Cantonese, and SDH content. Audio keeps its original codec and
-            selected subtitles use the saved crop. The agent describes locally
-            sampled audio and suggests flags. Review or change the final MKV
-            names and flags below.
-          </p>
-        </div>
-        <Badge>HUMAN GATE 1</Badge>
-      </div>
-      {job.state === "ANALYZING_SOURCE" && (
-        <p className="callout" role="status">
-          {activeAnalysis
-            ? activeAnalysis.progress_detail.phase ||
-              "Analyzing the source and subtitle content…"
-            : "Source analysis has stopped. Check the task on Overview and retry to continue."}{" "}
-          Track selection opens when analysis finishes. Agent reviews appear
-          below.
-        </p>
-      )}
-      {waiting && (needsAnalysis || inconclusive) && (
-        <div className="callout">
-          <p>
-            {needsAnalysis
-              ? "This job needs the initial track review. Run analysis for audio descriptions, subtitle findings, and suggested flags before selection."
-              : "Some findings are inconclusive. You can skip those tracks or retry analysis. You can override uncertain SDH explicitly below; uncertain language still needs another content check before muxing."}
-          </p>
-          <button
-            disabled={analyze.isPending || save.isPending}
-            onClick={() => analyze.mutate()}
-          >
-            {analyze.isPending ? "Queuing analysis…" : "Analyze tracks"}
-          </button>
-        </div>
-      )}
-      <ErrorBox error={analyze.error} />
-      {["audio", "subtitles"].map((kind) => (
-        <section key={kind}>
-          <h2>{kind === "audio" ? "Audio tracks" : "PGS subtitles"}</h2>
-          {job.tracks
-            .filter((t) => t.kind === kind)
-            .map((t) => {
-              const allowed = t.info.extractable;
-              const list = kind === "audio" ? audio : subs;
-              const detection = t.info.subtitle_detection;
-              const editable = enabled && allowed && !save.isPending;
-              const effectiveFlags = {
-                ...t.info,
-                ...(waiting ? flags[t.track_id] : {}),
-              };
-              const suggested =
-                kind === "subtitles" && t.info.base_name
-                  ? [
-                      t.info.base_name,
-                      effectiveFlags.hearing_impaired && "SDH",
-                      effectiveFlags.forced && "Forced",
-                    ]
-                      .filter(Boolean)
-                      .join(" ")
-                  : (t.info.suggested_name ?? t.info.mux_name ?? t.info.name);
-              const name = waiting
-                ? (names[t.track_id] ?? t.info.name_override ?? suggested)
-                : (t.info.mux_name ?? t.info.name);
-              return (
-                <article
-                  className={`track ${!allowed ? "disabled" : ""}`}
-                  key={t.track_id}
-                >
-                  <input
-                    id={`include-track-${t.track_id}`}
-                    type="checkbox"
-                    disabled={!editable}
-                    checked={list.includes(t.track_id)}
-                    onChange={() =>
-                      kind === "audio"
-                        ? setAudio(toggle(audio, t.track_id))
-                        : setSubs(toggle(subs, t.track_id))
-                    }
-                  />
-                  <div className="grow">
-                    <h3>
-                      <label htmlFor={`include-track-${t.track_id}`}>
-                        Track {t.track_id} · {t.info.language} · {t.info.codec}
-                      </label>
-                    </h3>
-                    <p>
-                      {[
-                        suggested,
-                        t.info.channel_layout ??
-                          (t.info.channels && `${t.info.channels} channels`),
-                        t.info.bit_depth && `${t.info.bit_depth}-bit`,
-                        t.info.sample_rate && `${t.info.sample_rate} Hz`,
-                        t.info.bitrate && `${t.info.bitrate} bps`,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ") || "No additional track metadata"}
-                    </p>
-                    {t.info.track_review && (
-                      <div className="subtitle-description">
-                        <p>{t.info.track_review.description}</p>
-                        <small>
-                          Agent confidence: {t.info.track_review.confidence}
-                        </small>
-                      </div>
-                    )}
-                    {t.info.audio_analysis && (
-                      <details className="subtitle-description">
-                        <summary>
-                          Local audio evidence ·{" "}
-                          {t.info.audio_analysis.sampled_seconds ?? 0}s sampled
-                        </summary>
-                        <p>{t.info.audio_analysis.method}</p>
-                        {t.info.audio_analysis.limitations.map((text) => (
-                          <p key={text}>{text}</p>
-                        ))}
-                        {t.info.audio_analysis.samples.map((sample) => (
-                          <div key={sample.id}>
-                            <small>
-                              Sample {sample.id} ·{" "}
-                              {sample.start_seconds.toFixed(1)}s ·{" "}
-                              {sample.duration_seconds.toFixed(1)}s duration
-                              {sample.detected_language &&
-                                ` · detected ${sample.detected_language} (${Math.round((sample.language_probability ?? 0) * 100)}%)`}
-                            </small>
-                            <p>
-                              {sample.segments
-                                ?.map((segment) => segment.text)
-                                .join(" ") ||
-                                "No speech transcript available for this sample."}
-                            </p>
-                          </div>
-                        ))}
-                      </details>
-                    )}
-                    {kind === "subtitles" && allowed && (
-                      <div className="subtitle-description">
-                        {detection ? (
-                          <>
-                            <p>
-                              <strong>
-                                {detection.status === "inconclusive"
-                                  ? "Inconclusive content check"
-                                  : "Content checked"}
-                              </strong>
-                              {" · "}SDH:{" "}
-                              {detection.hearing_impaired == null
-                                ? "unknown"
-                                : detection.hearing_impaired
-                                  ? "yes"
-                                  : "no"}
-                              {detection.language_confident === false &&
-                                " · Language/script uncertain"}
-                            </p>
-                            <p>{detection.explanation}</p>
-                            <small>
-                              {detection.method} · {detection.sampled_cues}/
-                              {detection.unique_cues} distinct cues inspected
-                            </small>
-                          </>
-                        ) : (
-                          <p>
-                            Language and SDH content check pending; source
-                            labels are unverified.
-                          </p>
-                        )}
-                        {t.info.source_subtitle_metadata?.name && (
-                          <small>
-                            Original source label:{" "}
-                            {t.info.source_subtitle_metadata.name}
-                          </small>
-                        )}
-                      </div>
-                    )}
-                    {allowed ? (
-                      <div className="track-name-field">
-                        <label htmlFor={`track-name-${t.track_id}`}>
-                          Final MKV track name
-                        </label>
-                        <input
-                          id={`track-name-${t.track_id}`}
-                          type="text"
-                          maxLength={255}
-                          value={name}
-                          disabled={!editable}
-                          onChange={(event) =>
-                            setNames((current) => ({
-                              ...current,
-                              [t.track_id]: event.target.value,
-                            }))
-                          }
-                        />
-                        {editable && name !== suggested && (
-                          <button
-                            className="secondary"
-                            onClick={() =>
-                              setNames((current) => {
-                                const next = { ...current };
-                                delete next[t.track_id];
-                                return next;
-                              })
-                            }
-                          >
-                            Use suggested name
-                          </button>
-                        )}
-                        {kind === "subtitles" && (
-                          <small>
-                            The name is a label. Language and flag settings are
-                            stored separately.
-                          </small>
-                        )}
-                      </div>
-                    ) : (
-                      <small>
-                        Unsupported codec for native extraction in this version
-                      </small>
-                    )}
-                    {allowed && (
-                      <fieldset className="track-flags" disabled={!editable}>
-                        <legend>Final MKV flags</legend>
-                        <div className="track-flag-grid">
-                          {flagLabels.map(([key, label]) => {
-                            const value = waiting
-                              ? (flags[t.track_id]?.[key] ?? t.info[key])
-                              : t.info[key];
-                            return (
-                              <label key={key}>
-                                {label}
-                                <select
-                                  value={
-                                    value == null ? "unknown" : String(value)
-                                  }
-                                  onChange={(event) =>
-                                    setFlags((current) => ({
-                                      ...current,
-                                      [t.track_id]: {
-                                        ...current[t.track_id],
-                                        [key]: event.target.value === "true",
-                                      },
-                                    }))
-                                  }
-                                >
-                                  <option value="unknown" disabled>
-                                    Unknown — choose
-                                  </option>
-                                  <option value="true">Yes</option>
-                                  <option value="false">No</option>
-                                </select>
-                              </label>
-                            );
-                          })}
-                        </div>
-                        {t.info.track_review && (
-                          <small>{t.info.track_review.flag_explanation}</small>
-                        )}
-                      </fieldset>
-                    )}
-                  </div>
-                  {effectiveFlags.default && <Badge>DEFAULT</Badge>}
-                  {effectiveFlags.forced && <Badge>FORCED</Badge>}
-                  {effectiveFlags.commentary && <Badge>COMMENTARY</Badge>}
-                  {effectiveFlags.hearing_impaired &&
-                    (kind === "audio" || detection) && <Badge>SDH</Badge>}
-                </article>
-              );
-            })}
-          {job.tracks.filter((t) => t.kind === kind).length === 0 && (
-            <p className="muted">
-              {job.state === "ANALYZING_SOURCE"
-                ? "Waiting for analysis…"
-                : "No tracks available."}
-            </p>
-          )}
-        </section>
-      ))}
-      {unresolvedFlags && (
-        <p className="error">
-          Choose Yes or No for unknown flags on selected tracks.
-        </p>
-      )}
-      {invalidNames && (
-        <p className="error">Selected tracks need a nonempty name.</p>
-      )}
-      <button
-        disabled={!enabled || save.isPending || invalidNames || unresolvedFlags}
-        onClick={() => save.mutate()}
-      >
-        Confirm {audio.length} audio + {subs.length} subtitle tracks →
-      </button>
-      <ErrorBox error={save.error} />
-      <AgentTranscript job={job} subtitles />
-    </>
   );
 }
 
@@ -1231,7 +1123,8 @@ function CRF({ job }: { job: Job }) {
   if (!job.crf)
     return (
       <Empty title="CRF analysis is not queued yet">
-        Complete source analysis and track selection to start CRF analysis.
+        CRF analysis starts after the source scan. Track review runs alongside
+        it.
       </Empty>
     );
   const { samples, profile_snapshot } = job.crf.data;
@@ -1248,7 +1141,7 @@ function CRF({ job }: { job: Job }) {
             Pin a bitrate to inspect its predicted QP and approximate CRF.
           </p>
         </div>
-        <Badge>HUMAN GATE 2</Badge>
+        <Badge>{job.encode_config ? "TARGET SAVED" : "CHOOSE A TARGET"}</Badge>
       </div>
       <BitrateCurve
         key={job.id}
@@ -1266,7 +1159,11 @@ function CRF({ job }: { job: Job }) {
           setBitrate(String(kbps / 1000));
         }}
       />
-      <section>
+      <section
+        className={
+          job.state === "WAITING_FOR_ENCODE_SELECTION" ? "needs-input" : ""
+        }
+      >
         <h2>Final encode selection</h2>
         <form
           className="inline-form"
@@ -1346,6 +1243,13 @@ function CRF({ job }: { job: Job }) {
         </p>
         <ErrorBox error={confirm.error} />
         <p className="muted">
+          {editableEncodingTask(job) && (
+            <>
+              <Link to={`/jobs/${job.id}/encode`}>
+                Change the saved encoding target →
+              </Link>{" "}
+            </>
+          )}
           Queued jobs start when a slot is available and continue when you close
           your browser. <Link to="/queue">Manage queue →</Link>
         </p>
@@ -1387,7 +1291,7 @@ function CRF({ job }: { job: Job }) {
               <tr key={p.crf}>
                 <td>{p.crf}</td>
                 <td>{(p.bitrate_kbps / 1000).toFixed(3)} Mbps</td>
-                <td>{p.average_qp ?? "—"}</td>
+                <td>{p.average_qp?.toFixed(2) ?? "—"}</td>
               </tr>
             ))}
           </tbody>
@@ -1404,10 +1308,7 @@ function TaskCard({ task }: { task: Task }) {
 function TaskAttempt({ task }: { task: Task }) {
   const pause = encodingPauseState(task);
   const query = useQueryClient();
-  const waitingForTool =
-    task.status === "RUNNING" &&
-    typeof task.progress_detail.tool === "string" &&
-    typeof task.progress_detail.tool_percentage !== "number";
+  const progress = taskProgress(task);
   const action = useMutation({
     mutationFn: (verb: string) => api(`/tasks/${task.id}/${verb}`, {}),
     // Refresh even after a stale retry request, and reset mutation errors when
@@ -1425,7 +1326,10 @@ function TaskAttempt({ task }: { task: Task }) {
         <Badge>{pause?.status ?? task.status}</Badge>
       </div>
       {pause && (task.pause_requested || task.paused_at) && (
-        <p role="status" className="callout">
+        <p
+          role="status"
+          className={`callout ${pause.status === "Paused" ? "needs-input" : ""}`}
+        >
           {pause.status}. Your progress is retained. The encode keeps its queue
           slot and can be resumed or cancelled.
         </p>
@@ -1439,15 +1343,11 @@ function TaskAttempt({ task }: { task: Task }) {
           )}
           <progress
             aria-label="Task progress"
-            value={waitingForTool ? undefined : task.progress}
+            value={progress.indeterminate ? undefined : progress.percent}
             max="100"
           />
           <div className="section-heading">
-            <span>
-              {waitingForTool
-                ? "Waiting for tool progress…"
-                : `${task.progress.toFixed(1)}%`}
-            </span>
+            <span>{progress.label}</span>
             <small>Attempt {task.attempt}</small>
           </div>
           {typeof task.progress_detail.tool_percentage === "number" && (
@@ -1475,6 +1375,9 @@ function TaskAttempt({ task }: { task: Task }) {
                     "phase",
                     "tool",
                     "tool_percentage",
+                    "indeterminate",
+                    "progress_basis",
+                    "phase_percentage",
                   ].includes(k),
               )
               .map(([k, v]) => (
@@ -1484,7 +1387,11 @@ function TaskAttempt({ task }: { task: Task }) {
                     {typeof v === "number"
                       ? k.includes("seconds")
                         ? clock(v)
-                        : v.toFixed(1)
+                        : k.endsWith("bytes")
+                          ? `${(v / 1024 / 1024).toFixed(1)} MiB`
+                          : Number.isInteger(v)
+                            ? v.toLocaleString()
+                            : v.toFixed(1)
                       : String(v ?? "—")}
                   </strong>
                 </div>
@@ -1495,6 +1402,7 @@ function TaskAttempt({ task }: { task: Task }) {
       {task.error_message && <div className="error">{task.error_message}</div>}
       {["FAILED", "CANCELLED"].includes(task.status) && (
         <button
+          className="needs-input"
           disabled={action.isPending}
           onClick={() => action.mutate("retry")}
         >
@@ -1520,18 +1428,21 @@ function EncodeStatus({ job }: { job: Job }) {
   const task = latestTask({
     ...job,
     tasks: job.tasks.filter((item) =>
-      ["encode", "validate", "mux"].includes(item.type),
+      ["encode", "validate", "prepare_tracks", "mux"].includes(item.type),
     ),
   });
   return (
     <>
+      <EncodeTargetEditor key={job.id} job={job} />
       {task ? (
         <TaskCard task={task} />
       ) : (
         <Empty title="No running encode">
-          Select tracks and review the CRF analysis to continue.
+          Choose an encoding target in CRF analysis. You can select tracks while
+          the video encodes.
         </Empty>
       )}
+      <EncoderSummary job={job} />
       <EncodingConfiguration job={job} />
       {job.validation.valid !== undefined && (
         <section>
@@ -1631,9 +1542,12 @@ function Gallery({ job }: { job: Job }) {
       job={job}
       controls={
         <>
-          <ScreenshotDecoderSettings key={job.id} job={job} />
-          {task && <TaskCard task={task} />}
-          <AgentTranscript key={`agent-${job.id}`} job={job} />
+          {task && task.status !== "SUCCEEDED" && <TaskCard task={task} />}
+          <details className="screenshot-settings">
+            <summary>Screenshot settings and agent transcript</summary>
+            <ScreenshotDecoderSettings key={job.id} job={job} />
+            <AgentTranscript key={`agent-${job.id}`} job={job} />
+          </details>
         </>
       }
     />
@@ -1641,46 +1555,61 @@ function Gallery({ job }: { job: Job }) {
 }
 
 function JobTaskLog({ job }: { job: Job }) {
+  const [expanded, setExpanded] = useState(false);
   const [selected, setSelected] = useState("");
   const selectedTask = job.tasks.find((task) => task.id === selected);
-  const task = selectedTask ?? latestTask(job);
+  const { pathname } = useLocation();
+  const task =
+    selectedTask ??
+    automaticLogTask(job, pathname.split("/").filter(Boolean)[2] ?? "");
   return (
     <section className="task-log" aria-labelledby="task-log-heading">
-      <div className="section-heading">
-        <h2 id="task-log-heading">Task log</h2>
-        {task && <Badge>{task.status}</Badge>}
-      </div>
-      <label>
-        View task log
-        <select
-          aria-label="View task log"
-          value={selectedTask?.id ?? ""}
-          disabled={job.tasks.length === 0}
-          onChange={(e) => setSelected(e.target.value)}
-        >
-          <option value="">Latest task (automatic)</option>
-          {[...job.tasks]
-            .sort((a, b) => b.created_at.localeCompare(a.created_at))
-            .map((t) => (
-              <option key={t.id} value={t.id}>
-                {readable(t.type)} · attempt {t.attempt} · {readable(t.status)}
-              </option>
-            ))}
-        </select>
-      </label>
-      {task ? (
-        <>
-          <small>
-            {readable(task.type)} · attempt {task.attempt}
-            {task.status === "RUNNING" && " · Live · refreshes every 3 seconds"}
-          </small>
-          <LogViewer task={task} />
-        </>
-      ) : (
-        <p className="muted">
-          No tasks yet. Logs will appear when processing begins.
-        </p>
-      )}
+      <details
+        className="log-fold"
+        open={expanded}
+        onToggle={(event) => setExpanded(event.currentTarget.open)}
+      >
+        <summary id="task-log-heading">
+          Task log {task && <Badge>{task.status}</Badge>}
+        </summary>
+        {expanded && (
+          <>
+            <label>
+              View task log
+              <select
+                aria-label="View task log"
+                value={selectedTask?.id ?? ""}
+                disabled={job.tasks.length === 0}
+                onChange={(e) => setSelected(e.target.value)}
+              >
+                <option value="">This page’s task (automatic)</option>
+                {[...job.tasks]
+                  .sort((a, b) => b.created_at.localeCompare(a.created_at))
+                  .map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {readable(t.type)} · attempt {t.attempt} ·{" "}
+                      {readable(t.status)}
+                    </option>
+                  ))}
+              </select>
+            </label>
+            {task ? (
+              <>
+                <small>
+                  {readable(task.type)} · attempt {task.attempt}
+                  {task.status === "RUNNING" &&
+                    " · Live · refreshes every 3 seconds"}
+                </small>
+                <LogViewer task={task} />
+              </>
+            ) : (
+              <p className="muted">
+                No tasks yet. Logs will appear when processing begins.
+              </p>
+            )}
+          </>
+        )}
+      </details>
     </section>
   );
 }
@@ -1700,48 +1629,6 @@ function LogViewer({ task }: { task: Task }) {
           ? "Loading task log…"
           : logs.data?.text || "No log output yet."}
       </pre>
-    </>
-  );
-}
-
-function Artifacts({ job }: { job: Job }) {
-  return (
-    <>
-      <section>
-        <h2>Generated artifacts</h2>
-        {job.artifacts.length === 0 ? (
-          <p className="muted">No artifacts yet.</p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Artifact</th>
-                <th>Type</th>
-                <th>Size</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {job.artifacts.map((a) => (
-                <tr key={a.id}>
-                  <td className="artifact-path">{a.path}</td>
-                  <td>{readable(a.artifact_type)}</td>
-                  <td>{size(a.size)}</td>
-                  <td>
-                    <a
-                      href={`/api/artifacts/${a.id}`}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open ↗
-                    </a>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
     </>
   );
 }

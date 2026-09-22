@@ -8,6 +8,15 @@ from pathlib import Path
 
 def transcribe(inventory, model, check_progress=print):
     result = {}
+    by_pcm = {}
+    total = sum(len(track["samples"]) for track in inventory["tracks"].values())
+    completed = 0
+
+    def finished():
+        nonlocal completed
+        completed += 1
+        check_progress(f"AUDIO_TRANSCRIBE_PROGRESS {completed}/{total}", flush=True)
+
     root = Path(inventory["workspace"]).resolve()
     for track_id, track in inventory["tracks"].items():
         result[str(track_id)] = {}
@@ -16,6 +25,15 @@ def transcribe(inventory, model, check_progress=print):
             if not path.is_relative_to(root):
                 raise ValueError("Audio sample is outside the workspace")
             check_progress(f"AUDIO_TRANSCRIBE track {track_id}, sample {sample['id']}", flush=True)
+            if sample.get("silent"):
+                result[str(track_id)][str(sample["id"])] = {"segments": [], "speech_skipped": "silent"}
+                finished()
+                continue
+            fingerprint = sample.get("pcm_sha256")
+            if fingerprint and fingerprint in by_pcm:
+                result[str(track_id)][str(sample["id"])] = by_pcm[fingerprint]
+                finished()
+                continue
             segments, info = model.transcribe(
                 str(path), beam_size=3, vad_filter=True, condition_on_previous_text=False
             )
@@ -33,6 +51,9 @@ def transcribe(inventory, model, check_progress=print):
                     for s in segments
                 ][:100],
             }
+            if fingerprint:
+                by_pcm[fingerprint] = result[str(track_id)][str(sample["id"])]
+            finished()
     return result
 
 

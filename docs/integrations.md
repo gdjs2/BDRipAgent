@@ -44,14 +44,25 @@ they cannot shadow standard-library modules.
 
 ## Track extraction
 
-Source analysis extracts all PGS tracks in one `mkvextract` pass for review before
-selection. Preparation reuses those original files and their detection results,
-extracting only selected audio and any missing/legacy PGS files in one further
-pass with audio `timestamps_v2`. All requested files must exist and be nonempty
-before registration/cropping. Empty selections skip extraction. Prepared tracks
-retain selection order; retries write new outputs under the new task directory.
-Metadata-based FFmpeg stream indexes are mapped separately from MKVToolNix IDs
-for local audio samples; unmatched streams are reported instead of guessed.
+Source analysis extracts supported audio and PGS tracks, audio timestamps, and video
+`timestamps_v2` in one `mkvextract` invocation. Native streams are reused for audio
+samples, selection preparation and muxing; video timestamps also feed screenshot
+indexing. Only missing cache files are extracted. Cropping writes separate outputs.
+
+A file lock and atomic completion manifest protect `cache/source-tracks/<source-key>`.
+The key includes the source path, device/inode, size and modification time. Paired
+x264/x265 jobs reuse the same extraction. Workspace files use hard links when possible
+and copies across filesystems; all batch outputs must be nonempty before publication.
+Existing original PGS files can seed this cache. Empty selections skip extraction.
+Metadata FFmpeg stream indexes are used only for audio without an extractable native
+stream; unmapped streams are reported instead of guessed.
+
+Local OCR and audio preparation run on one cancellable background lane while the
+agent reviews each prepared subtitle. This bounds local tool concurrency without
+waiting for the previous agent response. Source metadata and completed track findings
+are checkpointed under the task lease and published through `tracks_updated` SSE.
+Retries reuse those checkpoints, native tracks, and valid OCR evidence; failed reviews
+remain visible and require a task retry rather than an automatic retry loop.
 
 Extraction, timestamp indexing and final merging enable MKVToolNix's
 [`--gui-mode`](https://mkvtoolnix.download/doc/mkvextract.html) and parse its
@@ -153,10 +164,19 @@ passes. The API stores one target with the immutable analyzed profile snapshot:
 
 Send either body to `POST /api/jobs/{job_id}/encode-selection` after analysis.
 CRF is constrained by the saved profile limits. Bitrate is an integer from 1 to
-1,000,000 kbit/s; the UI accepts 0.001–1500 Mbps in 0.001 Mbps steps. Bitrate is
+1,000,000 kbit/s; the UI accepts 0.001–1000 Mbps in 0.001 Mbps steps. Bitrate is
 for the video stream: audio and container overhead add to the total file size.
 Targets are averages, and encoder constraints can affect the achieved bitrate.
 Mixed targets, a missing target, unknown modes and unsupported fields are rejected.
+
+`PATCH /api/jobs/{job_id}/encode-selection` accepts the rate-control fields alone
+(`rate_control` plus `crf` or `bitrate_kbps`) while the latest encode is queued,
+cancelled, or failed and the job remains in `ENCODING`. It preserves the codec,
+profile snapshot, queue position, hold state, task history, and retry count.
+Cancelled/failed attempts stay stopped until explicitly retried. The queue and
+job locks serialize target edits with worker admission; running, paused, or
+cancelling encodes reject edits. Smoke jobs and completed encoding stages reject
+edits too. `encode_target_updated` records the old and new target.
 
 CRF mode generates `-q <crf> --no-two-pass`. Bitrate mode generates
 `--vb <kbit/s> --two-pass --no-turbo`, keeping the selected preset and other
@@ -241,11 +261,19 @@ read with [Tesseract](https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage
 scripts; colloquial grammar identifies written Cantonese independently of script.
 Examples: `Simplified Chinese PGS`, `Traditional Chinese PGS SDH`, and
 `Cantonese (Traditional) PGS`, with IETF tags `zh-Hans`, `zh-Hant`, and `yue-Hant`.
-Japanese and Korean OCR packs avoid treating those scripts as Chinese.
+All Debian Tesseract language/script packs are installed. The source language is
+only an OCR model hint: French uses `fra`, Arabic `ara`, Russian `rus`, and so on;
+missing/incorrect hints still leave original images available for visual review.
+Other languages always receive visual language identification rather than inheriting
+the source tag. [langcodes](https://github.com/rspeer/langcodes) validates canonical
+BCP 47 tags and generates full language/script/region names: `fr` → `French PGS`,
+`pt-BR` → `Portuguese (Brazil) PGS`, `sr-Latn` → `Serbian (Latin) PGS`. Unsupported
+regional guesses are omitted; uncertain languages stay `und` and block preparation.
+All detected subtitle language tags are verified in the final MKV, not only Chinese.
 
 Program rules require multiple distinct cues and strong script evidence. Repeated
 explicit sound descriptions can establish SDH; absence of markers always requires
-visual agent review. Initial analysis always asks the agent to review SDH, including
+visual agent review. Initial analysis always asks the agent to review language and SDH, including
 program-positive results. Ambiguous script/dialect or OCR disagreement also goes to the
 agent, which receives original cue images and OCR but no source track name or SDH
 flag. Prompts and responses stream on the Tracks page. A saved `SUBTITLE_DETECTION`
@@ -254,13 +282,30 @@ The Tracks page displays detected names, descriptions and coverage before select
 
 A second streamed agent review receives all track evidence and recommends Default,
 Forced, Hearing impaired, Visual impaired/audio description and Commentary flags.
-It preserves the subtitle visual review's SDH decision. Unknown content flags stay
+It preserves the subtitle visual review's SDH decision. Citations are scoped to each
+track: audio uses supplied audio sample IDs; subtitles use supplied cue excerpts
+from the earlier visual review. Invented IDs are rejected with track-specific
+feedback. Invalid JSON, language codes or evidence trigger bounded correction
+attempts (`agent.selection_attempts`), with each attempt streamed to the frontend. Unknown content flags stay
 null until the user explicitly chooses Yes/No on selected tracks. The selection
 API accepts `track_names: {track_id: name}` and `track_flags: {track_id: {flag: bool}}`
 for selected tracks only. Overrides are stored alongside evidence in track metadata;
 manual names are single-line Unicode strings of 1–255 characters. They are passed
 as argv values, preserved through retries, and verified after MKVToolNix merging.
-No database migration is required. Editing a label alone does not alter flags.
+The backend reports `track_analysis_complete` and `tracks_editable`;
+completion is separate from confidence or frontend schema versions. Missing initial
+reviews are scheduled automatically, and `/tracks/analyze` is idempotent. Completed
+reviews do not rerun because a finding is inconclusive. Compact selection rows expose
+names, flags and evidence through **Details & edit**. Editing a name does not alter flags.
+Confirmed selections, per-group order, names, and flags are stored once per source
+path/size/mtime in `source_track_choices`. Saving updates all reviewed, editable peers;
+unfinished reviews and future jobs apply the current revision when ready. Each job
+keeps a `TrackSelection` snapshot and its own track evidence. These snapshots freeze
+before preparation for remux and determine the final video/audio/subtitle order.
+Clients may supply `shared_revision` to reject stale edits. The frontend preserves
+unsaved changes and offers **Load shared choices** after a conflicting remote save.
+Source inventory mismatches or unresolved selected languages require human review;
+choices never bypass track validation.
 
 Audio is decoded locally to mono 16 kHz WAV samples for analysis only; the final
 output retains original audio. The worker's isolated faster-whisper environment
@@ -268,19 +313,73 @@ runs CPU int8 inference under a shared cache lock to bound concurrent memory/CPU
 use. The agent receives transcripts, confidence, timestamps, signal measurements,
 and metadata, never raw audio. `integrations.audio_review` configures transcription
 (default true), model (default `small`, also accepts an installed model path),
-sample_count (1–8, default 3), sample_seconds (5–60, default 30), and cpu_threads
+initial sample_count (1–8, default 3), sample_seconds (5–60, default 30), max_rounds (1–30, default 6), and cpu_threads
 (1–8, default 2). Model weights download on first use into `cache/speech-models`.
 Thereafter cached models can run offline. If decoding or transcription fails, the
 review reports that limitation rather than fabricating content. `AUDIO_ANALYSIS`,
 `AUDIO_SAMPLE`, `AUDIO_TRANSCRIPTS`, and `TRACK_REVIEW` artifacts preserve evidence.
 
+Audio comparisons are iterative. The structured agent response must cover each
+audio track with a distinction relative to supplied peers, track-local evidence
+IDs, a resolution flag, and an optional request for further evidence. The worker
+bisects the largest untouched timeline intervals, sampling requested tracks and
+their comparison partners at matching times. It continues until the agent says
+the differences are sufficiently clear or the hard round limit is reached.
+`audio_review_max_rounds` in job creation overrides the server default for that
+job (also available in the New job form). The last permitted round requests a
+summary of possible differences for human review; no additional summary call is
+made. The budget persists across retries. Exhausted usable windows, decoding
+failures, or unavailable speech inference also yield an
+explicit inconclusive result. Every completed evidence batch and decision is
+checkpointed; retries retain transcripts. Prompts retain the first three and last
+twelve samples per track plus the prior comparison to bound context growth.
+Mono PCM fingerprints identify exact matches in sampled intervals only; silent
+samples skip inference and exact matches share transcription within a batch.
+
+### Independent workflow dependencies
+
+The source scan supplies the metadata and crop required by both lanes:
+
+```mermaid
+flowchart LR
+  Scan --> CRF --> EncodeChoice[Encode choice] --> Encode --> Validate
+  Scan --> Review[Track analysis and comparison] --> Tracks[Track choice]
+  Validate --> Prepare[Prepare selected tracks]
+  Tracks --> Prepare --> Remux --> Screenshots --> Release
+  Draft[Release details saved anytime] --> Release
+```
+
+`Task.lane` is `pipeline` or `tracks`; migration `0005` enforces one active task
+per job per lane. `ANALYZING_TRACKS` tasks do not change the main job state.
+Scheduling uses three task pools: `encode` uses `max_encoding_tasks` (default 1),
+`crf_analysis` uses `max_crf_tasks` (default 1), and all other task types use
+`max_other_tasks` (default 3). All three persist via `PATCH /api/queue`.
+Migration `0008` adds the independent CRF limit without resetting existing limits
+or pause state. The CRF worker consumes `bdrip.crf`; only the general worker runs
+the dispatcher. Worker admission rechecks all pool counts and the
+shared total worker capacity under the queue lock, including paused/stopping
+encodes. A blocked pool is skipped while other eligible tasks retain their order. Each task retains its own lease, progress, log, cancellation
+and retry. Failed track review does not block CRF or encoding. The main pipeline
+joins at `WAITING_FOR_TRACK_SELECTION` after video validation; a saved selection
+allows it to proceed automatically. Editing tracks invalidates old prepared outputs.
+Legacy waiting jobs with a completed source scan move to CRF automatically.
+
+Release PATCH requests save details throughout the workflow; POST generation
+remains gated on rendered screenshots and final output. Job updates and manifest
+snapshots are serialized; track checkpoints merge only their owned fields so
+concurrent encoding results and release drafts are preserved. The screenshot
+pipeline remains after remux because its existing review flow renders encoded
+comparison pairs and verifies final labels. No extra concurrent video decoder is
+started alongside encoding by this change.
+
 This is content sampling, not exhaustive transcription. Inconclusive subtitle
 findings remain visible before selection; a user may explicitly override SDH.
 Unresolved language/script still stops preparation instead of guessing. Increase
-`integrations.subtitle_detection.sample_cues` (8–192) and retry to widen evidence.
-`POST /jobs/{id}/tracks/analyze` lets waiting jobs rerun initial review; it refuses
-already selected or active jobs. Older prepared jobs are checked before their next
-mux. Existing outputs are not modified. Rebuild worker, agent, API and frontend.
+`integrations.subtitle_detection.sample_cues` (8–192) controls the sample size for
+new content reviews. Completed reviews remain cached; skip unresolved tracks.
+`POST /jobs/{id}/tracks/analyze` ensures a missing initial review is queued once;
+already active or completed reviews are reused and selected jobs are rejected. Older
+prepared jobs are checked before their next mux. Existing outputs are not modified. Rebuild worker, agent, API and frontend.
 The selection gate continues to accept PGS only.
 
 ## Codex screenshot selection
@@ -498,9 +597,23 @@ Command builders follow the [HandBrake CLI reference](https://handbrake.fr/docs/
 [mkvextract documentation](https://mkvtoolnix.download/doc/mkvextract.html), and
 [mkvmerge documentation](https://mkvtoolnix.download/doc/mkvmerge.html).
 Media/frame handling uses [PyAV](https://pyav.basswood.io/docs/stable/api/video.html).
-The worker image's actual HandBrake 1.6.1 and MKVToolNix binaries are exercised by
-the container smoke test; newer documentation may list additional flags that this
-implementation does not use.
+The worker image builds HandBrake CLI **1.11.2** from its
+[official source archive](https://github.com/HandBrake/HandBrake/releases/tag/1.11.2),
+following the [Linux build instructions](https://handbrake.fr/docs/en/latest/developer/build-linux.html).
+`worker/Dockerfile` pins both the release and its
+[published checksum](https://github.com/HandBrake/HandBrake/wiki/Checksums):
+`12b046350f2422dc28783ff94229aff4ba5fe5e683431e057355d36163b2593a`.
+Build and runtime use Debian Bookworm; compilers and source trees stay in the build
+stage. Downloads are verified before compilation, and the final binary is installed
+at `/opt/handbrake/bin/HandBrakeCLI`.
+
+`/usr/local/bin/HandBrakeCLI` is a small exec launcher. HandBrake 1.11 renamed
+`--two-pass`/`--no-two-pass` to `--multi-pass`/`--no-multi-pass`; the launcher translates
+those two legacy arguments for saved configurations and older running workers.
+It preserves argument boundaries, process IDs, signals, output streams and exit
+status. The native upgrade check exercises every project profile in both CRF and
+bitrate mode; the existing pause test checks suspension/resume of a real encode.
+CRF Studio sampling continues to use its separately pinned FFmpeg integration.
 
 The screenshot gallery polls current cross-codec reservations and disables identical
 or nearby frames before confirmation. The authoritative confirmation/replacement
@@ -509,3 +622,38 @@ simultaneous requests cannot both reserve conflicting frames. The larger of the 
 jobs' spacing settings applies (30 seconds by default); exact frame reuse is forbidden
 even with zero spacing. Deleted jobs do not reserve frames. Smoke-test variants
 reserve against other smoke variants while remaining independent of real releases.
+
+## Subtitle discovery and source-relative alignment
+
+`discover_subtitles` is an auxiliary task in the tracks lane and other-jobs pool.
+It has manual and opt-in automatic entry points, shares work by source identity,
+and fences imports/checkpoints against task cancellation and stale worker leases.
+A new import invalidates track confirmation without changing an existing encode
+or silently selecting the added track. Original source tracks stay intact.
+
+The discovery agent alone enables live web search. Its strict structured result
+contains verified original languages with sources and ranked subtitle candidates.
+The separate quality/alignment call receives bounded candidate cues and cached
+source OCR/text cues, with no web access. Dialogue anchors must reference supplied
+cue IDs from one source track. The worker fits `source_time = candidate_time *
+scale + offset`, snaps plausible FPS ratios only when residuals remain small, and
+checks coverage, residuals and leave-one-out fits independently of the agent's
+proposed transform. Different edits and nonlinear drift are reported for human
+intervention rather than accepted using a guessed offset.
+
+Downloads accept public HTTP(S) locations and bounded ZIPs; redirects are checked,
+network addresses are pinned after validation, and archive names cannot choose
+local paths. Captchas, accounts and paywalls are not bypassed. SRT/ASS content is
+parsed with pysubs2 1.8.0. Invalid timings and unreadable encodings are rejected;
+reading speed, long lines, overlaps and complex ASS styling generate review notes.
+These checks do not prove translation accuracy or identical rendering of every
+ASS effect.
+
+The worker includes the official [Subtitle Edit 5.2.0 seconv release](https://github.com/SubtitleEdit/subtitleedit/releases/tag/v5.2.0),
+pinned by SHA-256 for amd64/arm64, with Noto fonts. Its headless
+[PGS export options](https://github.com/SubtitleEdit/subtitleedit/blob/v5.2.0/docs/reference/command-line.md)
+set source canvas/FPS, readable font size and margins. Sup2sup checks and crops the
+result. Downloads already in PGS are retimed without recompressing their bitmap
+payloads. Retained originals, aligned PGS, cropped PGS and JSON provenance live
+outside individual job workspaces so sibling encodes and later remuxes can reuse
+them. Cropped data is reused only with the matching source geometry and crop.

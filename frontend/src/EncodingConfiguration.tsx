@@ -104,35 +104,37 @@ export function EncodingConfiguration({ job }: { job: Job }) {
     <section className="encoding-configuration">
       <h2>Encoding configuration</h2>
       <p className="muted">
-        Saved for this job when you confirmed the encoding target.{" "}
+        Current saved encoding target and profile. Recorded commands below
+        belong to the indicated attempt.{" "}
         {smoke &&
           "Smoke mode skips HandBrake; the saved encoder profile is shown for reference."}
       </p>
-      <table>
-        <tbody>
-          {rows.map(([label, value]) => (
-            <tr key={label}>
-              <th scope="row">{label}</th>
-              <td>{value}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <h3>Additional encoder options</h3>
-      <pre>{profile.extra_options || "None"}</pre>
-      <h3>
-        HandBrake command{argv && task ? ` · attempt ${task.attempt}` : ""}
-      </h3>
-      {smoke ? (
-        <p className="muted">No encoding command runs in smoke mode.</p>
-      ) : argv ? (
-        <pre>{displayCommand(argv)}</pre>
-      ) : (
-        <p className="muted">
-          The exact command will appear when the encoder starts
-          {task ? ` attempt ${task.attempt}` : ""}.
-        </p>
-      )}
+      <dl className="configuration-grid">
+        {rows.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+      <details className="configuration-command">
+        <summary>Encoder options and exact command</summary>
+        <h3>Additional encoder options</h3>
+        <pre>{profile.extra_options || "None"}</pre>
+        <h3>
+          HandBrake command{argv && task ? ` · attempt ${task.attempt}` : ""}
+        </h3>
+        {smoke ? (
+          <p className="muted">No encoding command runs in smoke mode.</p>
+        ) : argv ? (
+          <pre>{displayCommand(argv)}</pre>
+        ) : (
+          <p className="muted">
+            The exact command will appear when the encoder starts
+            {task ? ` attempt ${task.attempt}` : ""}.
+          </p>
+        )}
+      </details>
       <details>
         <summary>Complete saved configuration (JSON)</summary>
         <pre>

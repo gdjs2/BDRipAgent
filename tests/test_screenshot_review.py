@@ -160,7 +160,7 @@ def test_best_list_can_remove_add_and_clear_without_changing_finals(client, revi
 
 
 @pytest.mark.parametrize(
-    "ids,status", [(list(range(1, 17)), 422), ([1, 1], 422), ([False], 422), ([999], 409)]
+    "ids,status", [(list(range(1, 42)), 422), ([1, 1], 422), ([False], 422), ([999], 409)]
 )
 def test_best_curation_rejects_invalid_ids(client, review_job, ids, status):
     result = client.patch(f"/api/jobs/{review_job}/screenshots/best", json={"candidate_ids": ids})
@@ -254,14 +254,17 @@ def test_waiting_review_can_refresh_after_other_codec_reserves_frames(client, re
     assert client.get(f"/api/jobs/{review_job}/screenshots").json()["final"] == 0
 
 
-def test_agent_reuses_all_40_shortlist_images_and_ranks_fifteen(environment, tmp_path, monkeypatch):
+@pytest.mark.parametrize("count", [2, 15, 20, 40])
+def test_agent_reuses_all_40_shortlist_images_and_ranks_requested_count(
+    environment, tmp_path, monkeypatch, count
+):
     candidates = review_candidates()
-    ids = [1 + round(i * 39 / 14) for i in range(15)]
+    ids = [1 + round(i * 39 / (count - 1)) for i in range(count)]
     choices = [
         {
             "candidate_id": candidate_id,
             "score": 1 - rank / 100,
-            "category": "representative" if rank < 9 else "encode_challenging",
+            "category": "representative" if rank < round(count * 4 / 7) else "encode_challenging",
             "reason": "Fine texture and character detail",
             "shot_type": "close_up",
             "subject": f"subject {rank}",
@@ -272,7 +275,7 @@ def test_agent_reuses_all_40_shortlist_images_and_ranks_fifteen(environment, tmp
     shortlist_choices = [{**choices[0], "candidate_id": i} for i in range(1, 41)]
     inventory = {
         "candidates": candidates,
-        "policy": ScreenshotPolicy().model_dump(),
+        "policy": ScreenshotPolicy(best_count=count).model_dump(),
         "contact_sheets": [],
         "shortlisted_ids": list(range(1, 41)),
         "shortlisted_choices": shortlist_choices,
@@ -388,3 +391,60 @@ def test_gallery_disables_same_or_nearby_cross_codec_frames(client, review_job, 
         db.get(MovieJob, peer["id"]).deleted_at = now()
         db.commit()
     assert client.get(f"/api/jobs/{review_job}/screenshots").json()["items"][0]["reservation"] is None
+
+
+def test_adjust_best_count_reuse_shortlist_and_select_seven(client, review_job):
+    url = f"/api/jobs/{review_job}/screenshots"
+    before = client.get(url).json()
+    response = client.patch(url + "/best-count", json={"best_count": 20})
+    assert response.status_code == 200
+    assert response.json()["screenshot_policy"]["best_count"] == 20
+    assert client.get(url).json() == before  # Saving does not discard images or choices.
+    result = client.patch(url + "/best", json={"candidate_ids": list(range(1, 21))})
+    assert result.status_code == 200 and result.json()["recommended"] == 20
+    final = client.post(url + "/selection", json={"candidate_ids": list(range(1, 8))})
+    assert final.status_code == 200
+    assert final.json()["analysis"]["screenshot_selection"]["count"] == 7
+    with session() as db:
+        job = db.get(MovieJob, review_job)
+        job.state = "WAITING_FOR_RELEASE_DETAILS"
+        for task in db.scalars(select(Task).where(Task.job_id == review_job)):
+            task.status = "SUCCEEDED"
+        db.commit()
+    response = client.post(url + "/review", json={"best_count": 25})
+    assert response.status_code == 202
+    current = client.get(f"/api/jobs/{review_job}").json()
+    assert current["screenshot_policy"]["best_count"] == 25
+    assert len(current["analysis"]["review_shortlisted_ids"]) == 40
+    assert client.get(url).json()["final"] == 7
+
+
+@pytest.mark.parametrize("value", [1, 41, 20.5, True, "20"])
+def test_best_count_validation(client, review_job, value):
+    url = f"/api/jobs/{review_job}/screenshots"
+    for method, suffix in [(client.patch, "/best-count"), (client.post, "/review")]:
+        response = method(url + suffix, json={"best_count": value})
+        assert response.status_code == 422
+    assert client.get(f"/api/jobs/{review_job}").json()["state"] == "WAITING_FOR_SCREENSHOT_SELECTION"
+
+
+def test_best_count_cannot_change_during_running_review(client, review_job):
+    url = f"/api/jobs/{review_job}/screenshots"
+    result = client.post(url + "/review", json={"best_count": 20})
+    with session() as db:
+        db.get(Task, result.json()["id"]).status = "RUNNING"
+        db.commit()
+    assert client.patch(url + "/best-count", json={"best_count": 25}).status_code == 409
+    assert client.get(f"/api/jobs/{review_job}").json()["screenshot_policy"]["best_count"] == 20
+
+
+def test_new_jobs_default_to_twenty_best_candidates(new_job):
+    assert new_job["screenshot_policy"]["best_count"] == 20
+
+
+def test_best_count_falls_back_to_available_candidates():
+    from agent.schemas import review_policy
+
+    policy = review_policy(ScreenshotPolicy(best_count=20), 12)
+    assert policy.count == 12
+    assert policy.representative + policy.encode_challenging == 12

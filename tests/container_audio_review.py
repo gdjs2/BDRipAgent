@@ -10,8 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from shared.config import get_settings
 from worker.adapters.audio_review import analyze_audio
+
+from shared.config import get_settings
 
 
 def main():

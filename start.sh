@@ -6,15 +6,18 @@ fail() { printf 'Startup failed: %s\n' "$*" >&2; exit 1; }
 
 skip_login=false
 gpu=false
+update_encoder=false
 for argument in "$@"; do
 case "$argument" in
   --no-login) skip_login=true ;;
   --gpu) gpu=true ;;
+  --update-encoder) update_encoder=true ;;
   -h|--help)
-    printf 'Usage: ./start.sh [--gpu] [--no-login]\n\n'
-    printf 'Prepare configuration/storage, build and start all services, then check Codex login.\n'
+    printf 'Usage: ./start.sh [--gpu] [--no-login] [--update-encoder]\n\n'
+    printf 'Prepare storage and update application services, preserving the encoder, then check Codex login.\n'
     printf 'Existing credentials and data are preserved. --no-login skips Codex authentication.\n'
-    printf '%s\n' '--gpu gives the worker NVIDIA GPU access for optional screenshot scanning.'
+    printf '%s\n' '--gpu gives the general worker NVIDIA GPU access for screenshot scanning.'
+    printf '%s\n' '--update-encoder rebuilds the encoder after the queue is paused and active encoding tasks finish.'
     exit 0 ;;
   *) fail "Unknown option: $argument. Use --help for usage." ;;
 esac
@@ -108,10 +111,82 @@ storage_root="$(setting STORAGE_ROOT)"
 storage_root="${storage_root:-./data}"
 mkdir -p -m 755 -- "$storage_root/incoming" "$storage_root/jobs" "$storage_root/completed" "$storage_root/artifacts" "$storage_root/cache/agent"
 
-printf 'Building and starting BDRip Agent. The first build may take several minutes.\n'
-if ! "${compose[@]}" up -d --build --wait --wait-timeout 180; then
-  printf '\nInspect startup errors with: docker compose logs --tail=100 api worker agent postgres\n' >&2
+# Running encoders cannot move between containers. During the first upgrade,
+# preserve a legacy mixed worker until its current encode/CRF tasks finish.
+legacy_busy=false
+if [[ -n "$("${compose[@]}" ps --status running -q worker)" ]]; then
+  worker_state="$("${compose[@]}" exec -T worker python -c '
+import socket
+from sqlalchemy import select
+from shared.config import get_settings
+from shared.db import session
+from shared.models import QueueSettings, Task
+with session() as db:
+    active = db.scalar(select(Task.id).where(Task.worker_id == socket.gethostname(), Task.status == "RUNNING", Task.type.in_(["encode", "crf_analysis"])))
+    settings = db.get(QueueSettings, 1)
+    ready = getattr(get_settings(), "worker_pool", "all") == "other" or (settings and settings.paused and not active)
+    print("ready" if ready else "busy")
+')" || fail 'Could not check the existing worker; left it running.'
+  [[ "$worker_state" == ready ]] || legacy_busy=true
+fi
+encoder_exists="$("${compose[@]}" ps -a -q encoder)"
+if "$update_encoder" && [[ -n "$encoder_exists" ]]; then
+  encoder_host="$(docker inspect --format '{{.Config.Hostname}}' "$encoder_exists")" || fail 'Could not identify the encoder; left it unchanged.'
+  encoder_state="$("${compose[@]}" exec -T api python -c '
+import sys
+from sqlalchemy import or_, select
+from shared.db import session
+from shared.models import QueueSettings, Task
+with session() as db:
+    settings = db.get(QueueSettings, 1)
+    # Preserve CRF already running in an encoder from before the queue split.
+    active = db.scalar(select(Task.id).where(Task.status == "RUNNING", or_(Task.type == "encode", Task.worker_id == sys.argv[1])))
+    print("ready" if settings and settings.paused and not active else "busy")
+' "$encoder_host")" || fail 'Could not check encoder readiness; left it running.'
+  [[ "$encoder_state" == ready ]] || fail 'Pause the queue and wait for active encoder tasks to finish before --update-encoder. Normal ./start.sh preserves the encoder.'
+fi
+
+printf 'Building application services; existing encoder containers will be preserved.\n'
+build_services=(api frontend worker crf agent)
+if "$legacy_busy"; then build_services+=(general-upgrade); fi
+"${compose[@]}" build "${build_services[@]}"
+if ! "${compose[@]}" up -d --wait --wait-timeout 180 postgres redis; then
+  fail 'Inspect startup errors with: docker compose logs --tail=100 postgres redis'
+fi
+if "$legacy_busy"; then
+  # Stop accepting new deliveries, without signalling any active media process.
+  # The bridge consumes the legacy queue and relays encoding jobs to the encoder.
+  "${compose[@]}" exec -T worker python -c '
+import socket
+from worker.tasks import celery
+node = "celery@" + socket.gethostname()
+reply = celery.control.cancel_consumer("celery", destination=[node], reply=True, timeout=10)
+if not any("ok" in item.get(node, {}) for item in reply):
+    raise SystemExit("Could not drain the legacy consumer; existing encodes remain running")
+'
+fi
+application_services=(api agent frontend crf)
+if "$legacy_busy"; then application_services+=(general-upgrade); else application_services+=(worker); fi
+if ! "${compose[@]}" up -d --no-deps --wait --wait-timeout 180 "${application_services[@]}"; then
+  printf '\nInspect startup errors with: docker compose logs --tail=100 api worker encoder crf agent postgres\n' >&2
   exit 1
+fi
+if [[ -z "$encoder_exists" ]] || "$update_encoder"; then
+  "${compose[@]}" build encoder
+fi
+encoder_options=(--no-recreate)
+if "$update_encoder"; then encoder_options=(); fi
+"${compose[@]}" up -d --no-deps --wait --wait-timeout 180 "${encoder_options[@]}" encoder
+if "$legacy_busy"; then
+  # A reboot must not revive the legacy consumer with its old pipeline code.
+  # Its active processes remain untouched; future encodes use the new service.
+  docker update --restart=no "$("${compose[@]}" ps -q worker)" >/dev/null
+  printf 'Updated general worker is active. Legacy encodes continue uninterrupted. After they finish, pause the queue and run ./start.sh again to retire the bridge.\n'
+elif [[ -n "$("${compose[@]}" ps --status running -q general-upgrade)" ]]; then
+  "${compose[@]}" stop general-upgrade
+fi
+if "$update_encoder" && [[ -n "$encoder_exists" ]]; then
+  printf 'Encoder updated. Resume the queue from the dashboard when ready.\n'
 fi
 
 # Retained exports from older versions may still use the old torrent root. The

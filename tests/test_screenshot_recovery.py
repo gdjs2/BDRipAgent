@@ -150,7 +150,7 @@ def test_failed_selection_retains_verified_index_for_new_attempt(client, new_job
         db.commit()
     checks = []
     monkeypatch.setattr(
-        screenshots, "verify_b_frame_candidates", lambda *args: checks.append(True) or candidates
+        screenshots, "verify_b_frame_candidates", lambda *args, **kwargs: checks.append(True) or candidates
     )
     monkeypatch.setattr(screenshots, "contact_sheets", lambda *args: [])
     monkeypatch.setattr(screenshots, "render_pairs", lambda *args, **kwargs: {})
@@ -186,3 +186,147 @@ def test_failed_selection_retains_verified_index_for_new_attempt(client, new_job
     finally:
         ctx.close()
     assert checks == [True], "Retry must reuse the completed B-frame checks"
+
+
+def test_busy_agent_waits_beyond_four_requests_without_counting_connection_failures(
+    request_context, monkeypatch
+):
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        if len(calls) == 6:
+            raise httpx.ConnectError("Brief reconnect between reviews")
+        return httpx.Response(409 if len(calls) < 10 else 200, json={"selected": []})
+
+    transport(monkeypatch, handle)
+    assert screenshot_agent.select_screenshots(request_context, 60) == {"selected": []}
+    assert len(calls) == 10
+    assert any(update.get("agent_busy") for update in request_context.updates)
+    assert request_context.updates[-1]["agent_busy"] is False
+    assert all(json.loads(r.content)["task_id"] == "attempt" for r in calls)
+
+
+def test_busy_wait_is_bounded_and_cancellable(request_context, monkeypatch):
+    clock = [0.0]
+    transport(monkeypatch, lambda request: httpx.Response(409))
+    monkeypatch.setattr(screenshot_agent, "behavior", lambda: {"agent": {"busy_timeout_seconds": 12}})
+    monkeypatch.setattr(screenshot_agent.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        screenshot_agent.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    with pytest.raises(RuntimeError, match="remained busy for 12 seconds.*prepared B-frame"):
+        screenshot_agent.select_screenshots(request_context, 60)
+    assert clock[0] == 12
+
+    def cancelled():
+        if clock[0] >= 14:
+            raise Interrupted("cancelled during agent wait")
+
+    request_context.check = cancelled
+    with pytest.raises(Interrupted, match="cancelled during agent wait"):
+        screenshot_agent.select_screenshots(request_context, 60)
+
+
+def test_queue_stream_updates_task_position_and_clears_waiting(request_context, monkeypatch):
+    events = []
+    request_context.agent_event = events.append
+    messages = [
+        {
+            "type": "status",
+            "agent_queue_state": "waiting",
+            "queue_position": 2,
+            "text": "Waiting for agent · queue position 2",
+        },
+        {"type": "heartbeat"},
+        {
+            "type": "status",
+            "agent_queue_state": "waiting",
+            "queue_position": 1,
+            "text": "Waiting for agent · queue position 1",
+        },
+        {
+            "type": "status",
+            "agent_queue_state": "running",
+            "queue_position": 0,
+            "text": "Agent processing started",
+        },
+        {"type": "result", "result": {"selected": []}},
+    ]
+    transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "application/x-ndjson"},
+            text="\n".join(json.dumps(m) for m in messages),
+        ),
+    )
+    assert screenshot_agent.select_screenshots(request_context, 60) == {"selected": []}
+    updates = [p for p in request_context.updates if "agent_queue_position" in p]
+    assert [p["agent_queue_position"] for p in updates] == [2, 1, 0]
+    assert [p["agent_busy"] for p in updates] == [True, True, False]
+    assert len(events) == 3
+
+
+@pytest.mark.parametrize("action", ["Cleaning", "Repairing"])
+def test_subtitle_batch_phase_survives_queue_wait_and_start(request_context, action):
+    request_context.agent_event = lambda message: None
+    phase = f"{action} zh-Hans subtitles: batch 7/18"
+    messages = [
+        {
+            "type": "status",
+            "agent_queue_state": "waiting",
+            "queue_position": 2,
+            "text": "Waiting for agent · queue position 2",
+        },
+        {
+            "type": "status",
+            "agent_queue_state": "running",
+            "queue_position": 0,
+            "text": "Agent processing started",
+        },
+        {"type": "result", "result": {"decision": {}}},
+    ]
+    response = httpx.Response(200, text="\n".join(json.dumps(m) for m in messages))
+    screenshot_agent.consume_stream(request_context, response, label="Subtitle discovery agent", phase=phase)
+    assert request_context.updates[0]["phase"] == phase + " · Waiting for agent · queue position 2"
+    assert request_context.updates[0]["agent_busy"] is True
+    assert request_context.updates[1]["phase"] == phase
+    assert request_context.updates[1]["agent_busy"] is False
+
+
+@pytest.mark.parametrize(
+    "mode,repair,expected",
+    [
+        ("clean", False, "Cleaning zh-Hans subtitles: batch 7/18"),
+        ("clean", True, "Repairing zh-Hans subtitles: batch 7/18"),
+        ("align", False, "Aligning zh-Hans subtitles against source dialogue"),
+        ("search", False, "Searching for missing subtitles"),
+    ],
+)
+def test_discovery_passes_operation_phase_to_stream(
+    request_context, tmp_path, monkeypatch, mode, repair, expected
+):
+    from uuid import uuid4
+
+    from worker.pipeline import subtitle_discovery
+
+    request_context.settings.cache_root = tmp_path
+    request_context.job.id = str(uuid4())
+    request_context.task_id = str(uuid4())
+    calls = []
+    monkeypatch.setattr(
+        subtitle_discovery, "review", lambda ctx, **kwargs: calls.append(kwargs) or {"decision": {}}
+    )
+    inventory = {
+        "mode": mode,
+        "requested_language": "zh-Hans",
+        "batch": 7,
+        "total_batches": 18,
+        "candidate": {"language": "zh-Hans"},
+    }
+    if repair:
+        inventory["previous_review"] = {"issues": ["Damaged dialogue"]}
+    assert subtitle_discovery.agent_request(request_context, inventory) == {"decision": {}}
+    assert calls == [{"discovery": True, "phase": expected}]
+    assert request_context.updates[-1]["phase"] == expected

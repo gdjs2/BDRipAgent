@@ -1,4 +1,10 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, readable } from "./api";
@@ -17,11 +23,32 @@ export function Release({
   const [details, setDetails] = useState<ReleaseDetails>({
     chinese_name: "",
     extra_description: "",
+    movie_description: "",
     tracker: "",
     source: "",
     upload_screenshots: false,
     ...job.analysis.release_details,
   });
+  const edited = useRef(false);
+  const shared = job.analysis.shared_release_details;
+  const sharedRevision = shared?.revision ?? 0;
+  const [loadedRevision, setLoadedRevision] = useState(sharedRevision);
+  const staleShared = edited.current && loadedRevision !== sharedRevision;
+  const savedDetails = JSON.stringify(job.analysis.release_details ?? {});
+  useEffect(() => {
+    if (!edited.current) {
+      setLoadedRevision(sharedRevision);
+      setDetails({
+        chinese_name: "",
+        extra_description: "",
+        tracker: "",
+        source: "",
+        upload_screenshots: false,
+        movie_description: "",
+        ...JSON.parse(savedDetails),
+      });
+    }
+  }, [savedDetails, sharedRevision]);
   const [saved, setSaved] = useState(false);
   const task = [...job.tasks]
     .filter((t) => t.type === "generate_release")
@@ -29,23 +56,35 @@ export function Release({
   const active = job.tasks.some((t) =>
     ["QUEUED", "RUNNING"].includes(t.status),
   );
-  const available =
+  const available = !job.tasks.some(
+    (t) =>
+      t.type === "generate_release" && ["QUEUED", "RUNNING"].includes(t.status),
+  );
+  const canGenerate =
     ["WAITING_FOR_RELEASE_DETAILS", "GENERATING_RELEASE", "COMPLETE"].includes(
       job.state,
     ) && !active;
   const result = job.analysis.release_result;
   const submit = useMutation({
     mutationFn: (start: boolean) =>
-      api<Job>(`/jobs/${job.id}/release`, details, start ? "POST" : "PATCH"),
+      api<Job>(
+        `/jobs/${job.id}/release`,
+        { ...details, shared_revision: loadedRevision },
+        start ? "POST" : "PATCH",
+      ),
     onSuccess: (updated, start) => {
+      edited.current = false;
+      setLoadedRevision(updated.analysis.shared_release_details?.revision ?? 0);
       query.setQueryData(["job", job.id], updated);
       setSaved(!start);
     },
+    onError: () => query.invalidateQueries({ queryKey: ["job", job.id] }),
   });
   const convert = useMutation({
     mutationFn: (source: string) =>
       api<{ source: string }>("/release/source-description", { source }),
     onSuccess: (result, original) => {
+      edited.current = true;
       // Preserve any newer input if the user types while the request is pending.
       setDetails((current) =>
         current.source === original
@@ -57,14 +96,23 @@ export function Release({
     },
   });
   function change(field: keyof ReleaseDetails, value: string | boolean) {
+    edited.current = true;
     setDetails({ ...details, [field]: value });
     setSaved(false);
     submit.reset();
     if (field === "source") convert.reset();
   }
+  function loadShared() {
+    edited.current = false;
+    setDetails({ ...details, ...job.analysis.release_details });
+    setLoadedRevision(sharedRevision);
+    setSaved(false);
+    submit.reset();
+    convert.reset();
+  }
   function generate(event: FormEvent) {
     event.preventDefault();
-    submit.mutate(true);
+    if (canGenerate && available && !staleShared) submit.mutate(true);
   }
   const files = result
     ? job.artifacts.filter(
@@ -88,155 +136,237 @@ export function Release({
         Generate the BBCode, NFO, MD5 checksum, and private torrent. You can
         optionally upload your chosen comparison pairs to TTG.
       </p>
-      {!available && !task && (
-        <p className="muted">
-          Choose and render your final pairs in{" "}
-          <Link to={`/jobs/${job.id}/screenshots`}>Screenshots</Link> to unlock
-          this stage.
+      {job.analysis.remux_revision && canGenerate && !result && (
+        <p className="callout needs-input">
+          The revised MKV is ready. Generate release files below to create a new
+          BBCode, torrent, MD5, and NFO from this version.
         </p>
       )}
-      <section>
-        <form onSubmit={generate}>
-          <fieldset
-            disabled={!available || submit.isPending || convert.isPending}
-          >
-            <label>
-              Chinese name
-              <input
-                required
-                maxLength={300}
-                value={details.chinese_name}
-                onChange={(e) => change("chinese_name", e.target.value)}
-                placeholder="电影中文名"
-              />
-            </label>
-            <label>
-              Source
-              <input
-                required
-                maxLength={1000}
-                value={details.source}
-                onChange={(e) => change("source", e.target.value)}
-                placeholder="1080p Blu-ray AVC DTS-HD MA 5.1-GROUP"
-                aria-describedby="release-source-help"
-              />
-            </label>
-            <p id="release-source-help" className="muted">
-              Original disc or source release used for this encode. This text is
-              saved in the NFO and BBCode. You can paste a dotted release name
-              and convert it below, then edit the result.
-            </p>
-            <button
-              type="button"
-              className="secondary"
-              disabled={!details.source.trim() || convert.isPending}
-              onClick={() => convert.mutate(details.source)}
-            >
-              {convert.isPending ? "Converting…" : "Convert dotted name"}
-            </button>
-            <p className="muted">
-              Conversion removes the dotted movie title/year prefix, replaces
-              separator dots with spaces and @ with -, and keeps channel numbers
-              such as 5.1 and 7.1.
-            </p>
-            {convert.error && (
-              <p className="error" role="alert">
-                {convert.error.message}
-              </p>
+      {job.remux?.available && (
+        <p className="muted">
+          Need different audio or subtitles?{" "}
+          <Link to={`/jobs/${job.id}/tracks`}>Edit tracks and remux</Link> using
+          the retained encoded video.
+        </p>
+      )}
+      <p className="muted">
+        Release information is saved for this source video and shared by all its
+        encodes, including future jobs.
+        {shared && (
+          <>
+            {" "}
+            Last updated from{" "}
+            {shared.source_job_available === false ? (
+              <span>{shared.title} (removed job)</span>
+            ) : (
+              <Link to={`/jobs/${shared.source_job_id}/release`}>
+                {shared.title}
+              </Link>
             )}
-            <label>
-              Extra description (optional)
-              <textarea
-                maxLength={6000}
-                rows={3}
-                value={details.extra_description}
-                onChange={(e) => change("extra_description", e.target.value)}
-                placeholder="国英双语 · 内封中字"
-              />
-              <small>
-                Added beside the Chinese name in the release post heading.
-              </small>
-            </label>
-            <label>
-              Tracker announce URL
-              <input
-                required
-                type="text"
-                maxLength={4096}
-                autoComplete="off"
-                spellCheck={false}
-                value={details.tracker}
-                onChange={(e) => change("tracker", e.target.value)}
-                placeholder="https://tracker.example/announce?passkey=…"
-              />
-              <small>
-                HTTP, HTTPS, or UDP. Include your tracker passkey when required.
-              </small>
-            </label>
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={details.upload_screenshots}
-                onChange={(e) => change("upload_screenshots", e.target.checked)}
-              />
-              Upload screenshots to TTG
-            </label>
-            <p className="muted">
-              When unchecked, no screenshots are uploaded and the BBCode
-              screenshot section stays empty.
-            </p>
-            <div className="screenshot-actions">
+            .
+          </>
+        )}
+      </p>
+      {staleShared && (
+        <div className="callout needs-input" role="alert">
+          <p>
+            Release information changed in another encoding. Your unsaved edits
+            are kept here. Load the shared information before saving or
+            generating files.
+          </p>
+          <button type="button" className="secondary" onClick={loadShared}>
+            Load shared release information
+          </button>
+        </div>
+      )}
+      {shared?.snapshot_differs && (result || !available) && (
+        <p className="callout needs-input">
+          {available
+            ? "The existing release files use older information. Generate files again to apply the shared information to this encode."
+            : "This release task uses its saved information. The updated shared information can be used the next time you generate files."}
+        </p>
+      )}
+      {!canGenerate && !task && (
+        <p className="muted">
+          Save your release details now while analysis or encoding runs. File
+          generation and uploads become available after choosing and rendering
+          final pairs in{" "}
+          <Link to={`/jobs/${job.id}/screenshots`}>Screenshots</Link>.
+        </p>
+      )}
+      <section
+        className={`release-form ${job.state === "WAITING_FOR_RELEASE_DETAILS" ? "needs-input" : ""}`}
+      >
+        <details className="release-editor" open={!result}>
+          <summary>
+            {result
+              ? "Edit release details and regenerate files"
+              : "Release details"}
+          </summary>
+          <form onSubmit={generate}>
+            <fieldset
+              disabled={!available || submit.isPending || convert.isPending}
+            >
+              <label>
+                Chinese name
+                <input
+                  required
+                  maxLength={300}
+                  value={details.chinese_name}
+                  onChange={(e) => change("chinese_name", e.target.value)}
+                  placeholder="电影中文名"
+                />
+              </label>
+              <label>
+                Source
+                <input
+                  required
+                  maxLength={1000}
+                  value={details.source}
+                  onChange={(e) => change("source", e.target.value)}
+                  placeholder="1080p Blu-ray AVC DTS-HD MA 5.1-GROUP"
+                  aria-describedby="release-source-help"
+                />
+              </label>
+              <p id="release-source-help" className="muted">
+                Original disc or source release used for this encode. This text
+                is saved in the NFO and BBCode. You can paste a dotted release
+                name and convert it below, then edit the result.
+              </p>
               <button
                 type="button"
                 className="secondary"
-                disabled={
-                  !details.chinese_name.trim() ||
-                  !details.tracker.trim() ||
-                  !details.source.trim() ||
-                  convert.isPending
-                }
-                onClick={() => submit.mutate(false)}
+                disabled={!details.source.trim() || convert.isPending}
+                onClick={() => convert.mutate(details.source)}
               >
-                Save details
+                {convert.isPending ? "Converting…" : "Convert dotted name"}
               </button>
-              <button
-                type="submit"
-                disabled={
-                  (details.upload_screenshots &&
-                    !config.release?.upload_configured) ||
-                  convert.isPending
-                }
-              >
-                {submit.isPending
-                  ? "Saving…"
-                  : details.upload_screenshots
-                    ? "Generate files & upload screenshots"
-                    : "Generate files"}
-              </button>
-            </div>
-          </fieldset>
-          {saved && <p role="status">Release details saved.</p>}
-          {submit.error && (
-            <p className="error" role="alert">
-              {submit.error.message}
+              <p className="muted">
+                Conversion removes the dotted movie title/year prefix, replaces
+                separator dots with spaces and @ with -, and keeps channel
+                numbers such as 5.1 and 7.1.
+              </p>
+              {convert.error && (
+                <p className="error" role="alert">
+                  {convert.error.message}
+                </p>
+              )}
+              <label>
+                Extra description (optional)
+                <textarea
+                  maxLength={6000}
+                  rows={3}
+                  value={details.extra_description}
+                  onChange={(e) => change("extra_description", e.target.value)}
+                  placeholder="国英双语 · 内封中字"
+                />
+                <small>
+                  Added beside the Chinese name in the release post heading.
+                </small>
+              </label>
+              <label>
+                Movie description (BBCode, optional)
+                <textarea
+                  maxLength={100000}
+                  rows={10}
+                  value={details.movie_description}
+                  onChange={(e) => change("movie_description", e.target.value)}
+                  placeholder="Paste the full movie description here, including BBCode if needed."
+                />
+                <small>
+                  Full description block in the BBCode post. Leave blank to use
+                  the generated movie details and synopsis. This is separate
+                  from the extra description beside the title.
+                </small>
+              </label>
+              <label>
+                Tracker announce URL
+                <input
+                  required
+                  type="text"
+                  maxLength={4096}
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={details.tracker}
+                  onChange={(e) => change("tracker", e.target.value)}
+                  placeholder="https://tracker.example/announce?passkey=…"
+                />
+                <small>
+                  HTTP, HTTPS, or UDP. Include your tracker passkey when
+                  required.
+                </small>
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  disabled={!canGenerate}
+                  checked={details.upload_screenshots}
+                  onChange={(e) =>
+                    change("upload_screenshots", e.target.checked)
+                  }
+                />
+                Upload screenshots to TTG
+              </label>
+              <p className="muted">
+                When unchecked, no screenshots are uploaded and the BBCode
+                screenshot section stays empty.
+              </p>
+              <div className="screenshot-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={
+                    !details.chinese_name.trim() ||
+                    !details.tracker.trim() ||
+                    !details.source.trim() ||
+                    convert.isPending ||
+                    staleShared
+                  }
+                  onClick={() => submit.mutate(false)}
+                >
+                  Save details
+                </button>
+                <button
+                  type="submit"
+                  disabled={
+                    !canGenerate ||
+                    staleShared ||
+                    (details.upload_screenshots &&
+                      !config.release?.upload_configured) ||
+                    convert.isPending
+                  }
+                >
+                  {submit.isPending
+                    ? "Saving…"
+                    : details.upload_screenshots
+                      ? "Generate files & upload screenshots"
+                      : "Generate files"}
+                </button>
+              </div>
+            </fieldset>
+            {saved && <p role="status">Release details saved.</p>}
+            {submit.error && (
+              <p className="error" role="alert">
+                {submit.error.message}
+              </p>
+            )}
+          </form>
+          {details.upload_screenshots && !config.release?.upload_configured && (
+            <p className="attention-text">
+              Screenshot uploads need a TTG image-host API token. Set{" "}
+              <code>TU_TTG_TOKEN</code> in the server’s <code>.env</code> file,
+              then restart the API and worker, or uncheck uploads to generate
+              files now.
             </p>
           )}
-        </form>
-        {details.upload_screenshots && !config.release?.upload_configured && (
           <p className="muted">
-            Screenshot uploads need a TTG image-host API token. Set{" "}
-            <code>TU_TTG_TOKEN</code> in the server’s <code>.env</code> file,
-            then restart the API and worker, or uncheck uploads to generate
-            files now.
+            Successful image uploads are saved and reused on retry. The torrent
+            contains the MKV, NFO, and MD5 files. Preview the release text and
+            download the torrent below.
           </p>
-        )}
-        <p className="muted">
-          Successful image uploads are saved and reused on retry. The torrent
-          contains the MKV, NFO, and MD5 files. Preview the release text and
-          download the torrent below.
-        </p>
+        </details>
       </section>
-      {controls}
+      {task?.status !== "SUCCEEDED" && controls}
       {task && ["QUEUED", "RUNNING"].includes(task.status) && (
         <section role="status">
           <h3>

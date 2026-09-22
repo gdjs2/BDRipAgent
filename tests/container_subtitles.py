@@ -81,6 +81,7 @@ def main():
         shutil.copyfile(ctx.source(), root / "video.mkv")
         ctx.job = SimpleNamespace(
             title="Movie",
+            year=2025,
             release_name="Movie.2025.1080p.BluRay.x264-WiKi",
             analysis={"encoded_path": "video.mkv", "prepared_tracks": [audio, subtitle]},
             validation={"metrics": {"source_first_pts": 0, "encoded_first_pts": 0}},
@@ -88,7 +89,7 @@ def main():
         output = root / "final.mkv"
         ctx.run(mux_command(ctx, output))
         result = json.loads(ctx.run(["mkvmerge", "-J", output]))
-        assert result["container"]["properties"]["title"] == ctx.job.release_name
+        assert result["container"]["properties"]["title"] == "Movie (2025)"
         assert len(result["tracks"]) == 3
         a, s = [t["properties"] for t in result["tracks"][1:]]
         assert a["track_name"] == track_name(audio) == "English Dolby Digital 1.0"

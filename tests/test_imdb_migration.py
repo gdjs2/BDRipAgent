@@ -64,10 +64,15 @@ def test_imdb_migration_preserves_existing_jobs(tmp_path, monkeypatch):
             tasks = sa.Table("tasks", sa.MetaData(), autoload_with=connection)
             task = connection.execute(sa.select(tasks)).mappings().one()
             assert task["status"] == "SUCCEEDED" and not task["held"] and task["queue_priority"] == 0
+            assert task["lane"] == "pipeline"
+            indexes = {i["name"]: i for i in sa.inspect(connection).get_indexes("tasks")}
+            assert indexes["one_active_task_per_lane"]["column_names"] == ["job_id", "lane"]
+            assert "one_active_task_per_job" not in indexes
             assert not task["can_pause"] and not task["pause_requested"] and task["paused_at"] is None
             queue = sa.Table("queue_settings", sa.MetaData(), autoload_with=connection)
             settings = connection.execute(sa.select(queue)).mappings().one()
-            assert settings["max_concurrent_jobs"] == 1 and not settings["paused"]
+            assert settings["max_encoding_tasks"] == 1 and settings["max_other_tasks"] == 3
+            assert not settings["paused"]
         command.check(config)
     finally:
         engine().dispose()

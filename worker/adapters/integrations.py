@@ -6,6 +6,7 @@ from fractions import Fraction
 
 from shared.config import behavior
 from worker.adapters.crf_progress import CRFProgressReader
+from worker.progress import plan
 
 
 def pgs_dimensions(path):
@@ -166,8 +167,9 @@ class CRFStudioAdapter:
         video = ctx.job.analysis["video"]
         width, height = crop.dimensions(video["width"], video["height"])
         progress = ctx.output("crf", "progress.json")
-        ctx.progress(0, stage="starting", message="Starting CRF Studio", elapsed_seconds=0)
-        ctx.run(
+        steps = plan(ctx, encoding=95, reports=5)
+        steps["encoding"].progress(None, stage="starting", message="Starting CRF Studio", elapsed_seconds=0)
+        steps["encoding"].run(
             [
                 ctx.settings.crf_studio_bin,
                 "crf",
@@ -185,6 +187,8 @@ class CRFStudioAdapter:
             ],
             progress_reader=CRFProgressReader(progress),
         )
+        steps["encoding"].done("CRF samples encoded")
+        steps["reports"].progress(None, stage="saving", message="Validating and saving CRF results")
         raw = json.loads(output.read_text())
         result = normalize_crf(raw, profile["codec"])
         for path in sorted(output.parent.iterdir()):

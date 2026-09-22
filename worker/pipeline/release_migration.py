@@ -78,7 +78,10 @@ def migrate(db, job, settings, torrents):
                     if hashlib.file_digest(a, "sha256").digest() != hashlib.file_digest(b, "sha256").digest():
                         raise ValueError("Migration staging file already exists with different content")
             staged.append({"path": str(target), "kind": item["kind"], "storage": "workspace"})
-        exported = publish(SimpleNamespace(settings=settings, job=job, check=lambda: None), staged)
+        exported = publish(
+            SimpleNamespace(settings=settings, job=job, check=lambda: None, progress=lambda *a, **kw: None),
+            staged,
+        )
         record = json.loads(owner.read_text())
         # Persist cleanup provenance before committing new database paths. A rerun
         # after interruption can finish cleanup without removing unrelated files.

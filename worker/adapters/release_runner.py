@@ -4,6 +4,7 @@ Reuse its upload cache, templates, MediaInfo formatting, MD5 and torrent verifie
 Paths and inputs are prepared by the trusted worker; no shell commands are used.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from urllib.parse import quote, quote_plus
@@ -26,6 +28,7 @@ def write_json(path, value):
 class Progress:
     def __init__(self, path):
         self.path, self.phase = path, None
+        self.last_bytes_report = 0.0
 
     def report(self, percentage, phase, **detail):
         write_json(self.path, {"percentage": percentage, "phase": phase, **detail})
@@ -33,13 +36,21 @@ class Progress:
             print(f"Release: {phase}", flush=True)
             self.phase = phase
 
+    def bytes(self, completed, total, start, span, phase):
+        now = time.monotonic()
+        if completed in (0, total) or now - self.last_bytes_report >= 0.5:
+            self.report(
+                start + span * completed / max(1, total), phase, completed_bytes=completed, total_bytes=total
+            )
+            self.last_bytes_report = now
+
     def update(self, renderable):
         # BDRip_Scripts' torrent helper reports verified piece counts as Rich Text.
         text = renderable.plain
         verifying = "verifying torrent" in text
         match = re.search(r"\((\d+)/(\d+)\)", text)
         current, total = map(int, match.groups()) if match else (0, 0)
-        start, span = (90, 9) if verifying else (72, 18)
+        start, span = (80, 20) if verifying else (60, 20)
         self.report(
             start + span * current / max(1, total),
             "Verifying torrent pieces" if verifying else "Hashing torrent pieces",
@@ -59,7 +70,7 @@ def metadata(request, progress):
         except (ValueError, KeyError):
             pass
     if imdb_id:
-        progress.report(2, "Reading IMDb release metadata")
+        progress.report(10, "Reading IMDb release metadata", indeterminate=True)
         try:
             response = subprocess.run(
                 [sys.executable, "-I", str(Path(__file__).resolve()), "--metadata", imdb_id],
@@ -90,7 +101,7 @@ def metadata(request, progress):
 def run(request, token):
     from bdrip.release import bbcode, media, nfo, screenshots
     from bdrip.release.pipeline import extract_encoder_info
-    from bdrip.release.torrent import create_private_torrent, md5_file
+    from bdrip.release.torrent import create_private_torrent
 
     details = request["details"]
     source = details.get("source", "")
@@ -115,13 +126,23 @@ def run(request, token):
         try:
             os.link(movie, distribution_movie)
         except OSError:
-            progress.report(1, "Copying release media (hard links unavailable)")
-            shutil.copyfile(movie, distribution_movie)
+            copied = 0
+            progress.bytes(0, original.st_size, 0, 10, "Copying release media")
+            temporary = distribution_movie.with_suffix(".partial")
+            try:
+                with movie.open("rb") as incoming, temporary.open("wb") as outgoing:
+                    while block := incoming.read(8 * 1024 * 1024):
+                        outgoing.write(block)
+                        copied += len(block)
+                        progress.bytes(copied, original.st_size, 0, 10, "Copying release media")
+                temporary.replace(distribution_movie)
+            finally:
+                temporary.unlink(missing_ok=True)
     info, warnings = metadata(request, progress)
     info["name"], info["year"] = request["title"], request["year"]
     for warning in warnings:
         print(warning, flush=True)
-    progress.report(5, "Reading final media information")
+    progress.report(12, "Reading final media information", indeterminate=True)
     technical = media.media_metadata(distribution_movie)
     smoke = request.get("smoke_test", False)
     encoder = "SMOKE TEST - Source reused" if smoke else "WiKi"
@@ -173,7 +194,7 @@ def run(request, token):
         cached = screenshots.cached_screenshot_urls(uploads, comparison.parent)
         done = len(cached.get("Comparison", {}))
         progress.report(
-            10 + 40 * done / total, "Uploading selected screenshot pairs", uploaded=done, total_images=total
+            15 + 20 * done / total, "Uploading selected screenshot pairs", uploaded=done, total_images=total
         )
 
         def upload_event(event, path, attempt, attempts, error):
@@ -181,7 +202,7 @@ def run(request, token):
             if event == "success":
                 done += 1
             progress.report(
-                10 + 40 * done / total,
+                15 + 20 * done / total,
                 "Uploading selected screenshot pairs",
                 uploaded=done,
                 total_images=total,
@@ -213,9 +234,9 @@ def run(request, token):
         "encoder": encoder,
         "source": source,
         "encoder_info": encoder_info,
-        "movie_description": description,
+        "movie_description": details.get("movie_description", "").strip() or description,
     }
-    progress.report(52, "Generating BBCode and NFO")
+    progress.report(35, "Generating BBCode and NFO", indeterminate=True)
     # render() otherwise always refetches IMDb, even with complete overrides. This
     # isolated process supplies the one bounded/cached lookup to the upstream template.
     lookup = bbcode.imdb_metadata
@@ -241,11 +262,18 @@ def run(request, token):
     }
     nfo_path = package / f"{release_name}.nfo"
     nfo_path.write_bytes(nfo.render_nfo(nfo_metadata, "cp437"))
-    progress.report(58, "Calculating movie MD5")
-    checksum = md5_file(distribution_movie)
+    hashed = 0
+    digest = hashlib.md5()
+    progress.bytes(0, original.st_size, 40, 20, "Calculating movie MD5")
+    with distribution_movie.open("rb") as stream:
+        while block := stream.read(8 * 1024 * 1024):
+            digest.update(block)
+            hashed += len(block)
+            progress.bytes(hashed, original.st_size, 40, 20, "Calculating movie MD5")
+    checksum = digest.hexdigest()
     md5_path = package / f"{release_name}.md5"
     md5_path.write_text(f"{checksum}  {distribution_movie.name}\n", encoding="ascii")
-    progress.report(72, "Hashing torrent pieces")
+    progress.report(60, "Hashing torrent pieces")
     torrent_path = output / f"{release_name}.torrent"
     infohash = create_private_torrent(
         {"torrent": {"tracker": details["tracker"], "verify": True}},

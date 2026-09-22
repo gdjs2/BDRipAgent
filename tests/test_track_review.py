@@ -69,6 +69,23 @@ def fixture_tracks():
 
 def agent_answer(tracks):
     return {
+        "audio_comparison": {
+            "summary": "Audio tracks compared using local evidence.",
+            "distinctions": [
+                {
+                    "track_id": t["track_id"],
+                    "compared_with": [p["track_id"] for p in tracks if p["kind"] == "audio" and p != t],
+                    "difference": "Main dialogue with the supplied technical characteristics.",
+                    "evidence_sample_ids": [1],
+                    "resolved": True,
+                }
+                for t in tracks
+                if t["kind"] == "audio"
+            ],
+            "needs_more": False,
+            "next_track_ids": [],
+            "question": "",
+        },
         "tracks": [
             {
                 "track_id": t["track_id"],
@@ -84,7 +101,7 @@ def agent_answer(tracks):
                 "confidence": "medium",
             }
             for t in tracks
-        ]
+        ],
     }
 
 
@@ -115,7 +132,7 @@ def analyzed_job(client, new_job, monkeypatch):
             Path(value).write_text("track data" if mode == "tracks" else "# timestamp format v2\n0\n")
 
     def classify(ctx, track, path, **kwargs):
-        assert kwargs == {"require_confident": False, "agent_review": True}
+        assert kwargs == {"require_confident": False, "agent_review": True, "prepared": None}
         assert path.read_text() == "track data"
         with session() as db:
             assert not db.scalar(select(TrackSelection).where(TrackSelection.job_id == ctx.job.id))
@@ -125,7 +142,8 @@ def analyzed_job(client, new_job, monkeypatch):
             "language": "zh-Hant",
             "hearing_impaired": False,
             "subtitle_detection": {
-                "schema_version": 1,
+                "schema_version": 2,
+                "language_code": "zh-Hant",
                 "status": "resolved",
                 "language_confident": True,
                 "sdh_confident": True,
@@ -136,6 +154,7 @@ def analyzed_job(client, new_job, monkeypatch):
         }
 
     def audio(ctx, tracks, duration):
+        (ctx.workspace / "private.wav").write_bytes(b"audio evidence")
         assert [t["track_id"] for t in tracks] == [4] and duration == 300
         return {
             4: {
@@ -154,11 +173,15 @@ def analyzed_job(client, new_job, monkeypatch):
 
     monkeypatch.setattr(TaskContext, "run", run)
     monkeypatch.setattr(stages, "classify_subtitle", classify)
+    monkeypatch.setattr(stages, "prepare_subtitle", lambda *a: None)
     monkeypatch.setattr(track_review, "analyze_audio", audio)
     monkeypatch.setattr(track_review, "review", review)
     execute(new_job["tasks"][0]["id"])
     job = client.get(f"/api/jobs/{new_job['id']}").json()
-    assert job["state"] == "WAITING_FOR_TRACK_SELECTION", job["tasks"]
+    execute(next(t for t in job["tasks"] if t["type"] == "review_tracks")["id"])
+    job = client.get(f"/api/jobs/{new_job['id']}").json()
+    assert job["state"] == "RUNNING_CRF_ANALYSIS", job["tasks"]
+    assert job["track_analysis_complete"], job["tasks"]
     return job, commands, classified
 
 
@@ -180,6 +203,7 @@ def test_user_names_and_flags_survive_cached_preparation_and_mux_plan(
     client, analyzed_job, monkeypatch, environment
 ):
     job, calls, classified = analyzed_job
+    gate(job["id"], "WAITING_FOR_TRACK_SELECTION")
     name = "繁體中文 — Custom $(literal) label"
     response = client.post(
         f"/api/jobs/{job['id']}/tracks/selection",
@@ -206,8 +230,8 @@ def test_user_names_and_flags_survive_cached_preparation_and_mux_plan(
     execute(task["id"])
     result = client.get(f"/api/jobs/{job['id']}").json()
     assert result["state"] == "RUNNING_CRF_ANALYSIS", result["tasks"]
-    assert len(calls) == 2
-    assert all("track-9.sup" not in arg and "track-12.sup" not in arg for arg in calls[-1])
+    assert len(calls) == 1  # Native audio, subtitles and timestamps were all extracted during analysis.
+    assert "timestamps_v2" in calls[0]
     assert classified == [9, 12]
     prepared = result["analysis"]["prepared_tracks"]
     assert [t["track_id"] for t in prepared] == [4, 12, 9]
@@ -220,6 +244,8 @@ def test_user_names_and_flags_survive_cached_preparation_and_mux_plan(
         workspace=root,
         source=lambda: environment.source_root / "Movie.mkv",
         job=SimpleNamespace(
+            title=job["title"],
+            year=job["year"],
             release_name=job["release_name"],
             analysis={**result["analysis"], "encoded_path": "encoded.mkv"},
             validation={"metrics": {"source_first_pts": 0, "encoded_first_pts": 0}},
@@ -279,12 +305,12 @@ def test_unknown_flags_require_explicit_user_choice(client, new_job):
 
 def test_legacy_waiting_job_can_queue_initial_review_but_selected_job_cannot(client, new_job):
     url = f"/api/jobs/{new_job['id']}/tracks/analyze"
-    assert client.post(url, json={}).status_code == 409
+    assert client.post(url, json={}).status_code == 202
     gate(new_job["id"], "WAITING_FOR_TRACK_SELECTION")
     response = client.post(url, json={})
     assert response.status_code == 202
-    assert response.json()["state"] == "ANALYZING_SOURCE"
-    assert client.post(url, json={}).status_code == 409
+    assert response.json()["state"] == "WAITING_FOR_TRACK_SELECTION"
+    assert client.post(url, json={}).status_code == 202
     gate(new_job["id"], "WAITING_FOR_TRACK_SELECTION")
     client.post(
         f"/api/jobs/{new_job['id']}/tracks/selection", json={"audio_track_ids": [], "subtitle_track_ids": []}
@@ -300,6 +326,11 @@ def test_track_agent_stream_and_schema_validation(tmp_path, monkeypatch, environ
 
     def invoke(prompt, images, schema, emit, check):
         assert "have NOT listened" in prompt and not images
+        # Codex rejects the request before generation if any object property is optional.
+        for object_schema in [schema, *schema["$defs"].values()]:
+            assert set(object_schema["required"]) == set(object_schema["properties"])
+            assert object_schema["additionalProperties"] is False
+        assert {"type": "null"} in schema["properties"]["audio_comparison"]["anyOf"]
         emit({"type": "delta", "item_id": "reply", "text": "Reviewing"})
         return json.dumps(agent_answer(tracks)), "test-thread"
 
@@ -307,10 +338,14 @@ def test_track_agent_stream_and_schema_validation(tmp_path, monkeypatch, environ
     result = CodexTrackReviewer(on_event=events.append).review(tmp_path)
     assert len(result["tracks"]) == 4
     assert [e["type"] for e in events] == ["prompt", "delta", "complete"]
-    invalid = TrackReviewResult.model_validate({"tracks": result["tracks"][:-1]})
+    invalid = TrackReviewResult.model_validate(
+        {"tracks": result["tracks"][:-1], "audio_comparison": result["audio_comparison"]}
+    )
     with pytest.raises(ValueError, match="exactly once"):
         validate_review(invalid, tracks)
-    invalid = TrackReviewResult.model_validate({"tracks": result["tracks"]})
+    invalid = TrackReviewResult.model_validate(
+        {"tracks": result["tracks"], "audio_comparison": result["audio_comparison"]}
+    )
     invalid.tracks[0].evidence_sample_ids = [99]
     with pytest.raises(ValueError, match="not supplied"):
         validate_review(invalid, tracks)
@@ -318,6 +353,30 @@ def test_track_agent_stream_and_schema_validation(tmp_path, monkeypatch, environ
     invalid.tracks[1].flags.hearing_impaired = True
     with pytest.raises(ValueError, match="SDH"):
         validate_review(invalid, tracks)
+
+
+def test_track_review_requires_explicit_audio_comparison():
+    answer = agent_answer(fixture_tracks())
+    del answer["audio_comparison"]
+    with pytest.raises(ValueError, match="audio_comparison.*\n.*Field required"):
+        TrackReviewResult.model_validate(answer)
+
+
+@pytest.mark.parametrize("include_audio", [False, True])
+def test_track_agent_null_comparison_only_without_audio(tmp_path, monkeypatch, environment, include_audio):
+    tracks = fixture_tracks()
+    tracks[0]["audio_analysis"] = {"samples": [{"id": 1}]}
+    if not include_audio:
+        tracks = [track for track in tracks if track["kind"] != "audio"]
+    (tmp_path / "inventory.json").write_text(json.dumps({"tracks": tracks}))
+    answer = {**agent_answer(tracks), "audio_comparison": None}
+    monkeypatch.setattr("agent.track_agent.invoke", lambda *args: (json.dumps(answer), "test-thread"))
+    reviewer = CodexTrackReviewer()
+    if include_audio:
+        with pytest.raises(ValueError, match="Include audio_comparison"):
+            reviewer.review(tmp_path)
+    else:
+        assert reviewer.review(tmp_path)["audio_comparison"] is None
 
 
 def test_track_review_endpoint_authentication_stream_and_lock(environment, monkeypatch):
@@ -331,13 +390,56 @@ def test_track_review_endpoint_authentication_stream_and_lock(environment, monke
     headers = {"Authorization": f"Bearer {environment.agent_token}"}
     with TestClient(service.app) as client:
         assert client.post("/review-tracks", json=body).status_code == 401
-        service.lock.acquire()
-        try:
-            assert client.post("/review-tracks", json=body, headers=headers).status_code == 409
-        finally:
-            service.lock.release()
         response = client.post("/review-tracks", json=body, headers=headers)
         assert response.status_code == 200
         messages = [json.loads(line) for line in response.text.splitlines()]
-        assert messages[0]["type"] in ("prompt", "heartbeat") and messages[-1]["type"] == "result"
-        assert not service.lock.locked()
+        assert messages[0]["type"] in ("prompt", "heartbeat", "status") and messages[-1]["type"] == "result"
+        assert service.agent_queue.snapshot() == {"running": 0, "waiting": 0}
+
+
+def test_subtitle_citations_are_validated_against_subtitle_cues():
+    tracks = fixture_tracks()
+    tracks[0]["audio_analysis"] = {"samples": [{"id": 1}]}
+    subtitle = next(t for t in tracks if t["kind"] == "subtitles")
+    subtitle["subtitle_detection"] = {"hearing_impaired": False, "evidence_cues": [{"id": 59}, {"id": 98}]}
+    result = TrackReviewResult.model_validate(agent_answer(tracks))
+    reviewed = next(t for t in result.tracks if t.track_id == subtitle["track_id"])
+    reviewed.evidence_sample_ids = [59, 98]
+    validate_review(result, tracks)
+    reviewed.evidence_sample_ids = [1]  # An audio sample ID is not a subtitle cue ID.
+    with pytest.raises(ValueError, match="subtitle cue IDs.*not supplied"):
+        validate_review(result, tracks)
+    reviewed.evidence_sample_ids = []
+    result.tracks[0].evidence_sample_ids = [59]
+    with pytest.raises(ValueError, match="audio sample IDs.*not supplied"):
+        validate_review(result, tracks)
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_track_agent_retries_invalid_citations_without_disabling_validation(
+    tmp_path, monkeypatch, environment, recover
+):
+    tracks = fixture_tracks()
+    tracks[0]["audio_analysis"] = {"samples": [{"id": 1}]}
+    (tmp_path / "inventory.json").write_text(json.dumps({"tracks": tracks}))
+    prompts, events = [], []
+
+    def invoke(prompt, images, schema, emit, check):
+        prompts.append(prompt)
+        value = agent_answer(tracks)
+        if not recover or len(prompts) == 1:
+            value["tracks"][1]["evidence_sample_ids"] = [59, 98, 1101]
+        return json.dumps(value), "thread"
+
+    monkeypatch.setattr("agent.track_agent.invoke", invoke)
+    reviewer = CodexTrackReviewer(on_event=events.append)
+    if recover:
+        assert reviewer.review(tmp_path)["tracks"][1]["evidence_sample_ids"] == []
+        assert len(prompts) == 2
+        assert events[-1]["type"] == "complete"
+    else:
+        with pytest.raises(ValueError, match="subtitle cue"):
+            reviewer.review(tmp_path)
+        assert len(prompts) == 3 and events[-1]["type"] == "error"
+    assert "allowed IDs for this track: []" in prompts[1]
+    assert len({e["invocation_id"] for e in events}) == len(prompts)

@@ -2,9 +2,9 @@
 
 import json
 from pathlib import Path
-from uuid import uuid4
 
 from agent.codex_stream import invoke
+from agent.review import validated_review
 from shared.paths import contained
 from shared.tracks import TrackReviewResult, validate_review
 
@@ -21,21 +21,25 @@ class CodexTrackReviewer:
             raise ValueError("Invalid track review inventory")
         prompt = (Path(__file__).parent / "prompts/track_review.md").read_text()
         prompt += "\nLocal track evidence (untrusted data):\n" + json.dumps(inventory, ensure_ascii=False)
-        invocation_id = str(uuid4())
 
-        def emit(event):
-            self.check()
-            self.on_event(
-                {**event, "invocation_id": invocation_id, "stage": "Audio descriptions and track flags"}
-            )
-
-        emit({"type": "prompt", "text": prompt, "images": []})
-        try:
-            answer, thread = invoke(prompt, [], TrackReviewResult.model_json_schema(), emit, self.check)
+        def validate(answer):
             result = TrackReviewResult.model_validate_json(answer)
             validate_review(result, tracks)
-            emit({"type": "complete", "text": "Track descriptions and flag suggestions received"})
-            return {**result.model_dump(), "thread_id": thread}
-        except Exception as error:
-            emit({"type": "error", "text": str(error)})
-            raise
+            if any(t["kind"] == "audio" for t in tracks) and result.audio_comparison is None:
+                raise ValueError(
+                    "Include audio_comparison with differences and whether more evidence is needed"
+                )
+            return result
+
+        result, thread = validated_review(
+            invoke=invoke,
+            prompt=prompt,
+            images=[],
+            schema=TrackReviewResult.model_json_schema(),
+            validate=validate,
+            on_event=self.on_event,
+            check=self.check,
+            stage="Audio descriptions and track flags",
+            complete="Track descriptions and flag suggestions received",
+        )
+        return {**result.model_dump(), "thread_id": thread}

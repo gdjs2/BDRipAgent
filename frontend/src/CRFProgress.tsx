@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { Task } from "./types";
+import { taskProgress } from "./task-progress";
 
 export function CRFProgress({ task }: { task: Task }) {
   const detail = task.progress_detail;
@@ -37,13 +38,15 @@ export function CRFProgress({ task }: { task: Task }) {
     .join(":");
   const total = number("total");
   const completed = number("completed");
-  const indeterminate = running && !total;
+  const progress = taskProgress(task);
+  const indeterminate =
+    progress.indeterminate || (running && (!total || detail.flushing === true));
   const encoding = running && detail.stage === "encoding" && completed < total;
-  const percent = succeeded ? 100 : Math.min(99, Math.max(0, task.progress));
+  const percent = progress.percent;
   const message = queued
     ? task.held
       ? "On hold in the queue"
-      : "Waiting for a worker slot"
+      : "Waiting for a CRF analysis slot"
     : succeeded
       ? "Analysis complete"
       : task.status === "FAILED"
@@ -63,10 +66,10 @@ export function CRFProgress({ task }: { task: Task }) {
         <span role="status">{message}</span>
         <strong>
           {indeterminate
-            ? "Preparing…"
+            ? "Working…"
             : queued
               ? "Queued"
-              : `${percent.toFixed(0)}%`}
+              : `${percent.toFixed(1)}%`}
         </strong>
       </div>
       <progress
@@ -128,11 +131,17 @@ export function CRFProgress({ task }: { task: Task }) {
                 ? "Flushing encoder — finishing the current sample"
                 : "Current sample"}
             </span>
-            <span>{Math.floor(number("sample_fraction") * 100)}%</span>
+            <span>
+              {detail.flushing
+                ? "Finishing…"
+                : `${Math.floor(number("sample_fraction") * 100)}% submitted`}
+            </span>
           </div>
           <progress
             aria-label="Current sample progress"
-            value={number("sample_fraction") * 100}
+            value={
+              detail.flushing ? undefined : number("sample_fraction") * 100
+            }
             max={100}
           />
         </div>

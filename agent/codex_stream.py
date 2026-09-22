@@ -12,8 +12,22 @@ import time
 from shared.config import behavior, get_settings
 
 
-def invoke(prompt, images, schema, emit, check):
+def invoke(
+    prompt,
+    images,
+    schema,
+    emit,
+    check,
+    *,
+    web_search=False,
+    status="Selecting screenshots",
+    model=None,
+    reasoning_effort=None,
+):
     settings = get_settings()
+    options = behavior()["agent"]
+    model = model or options.get("model")
+    reasoning_effort = reasoning_effort or options.get("reasoning_effort")
     with (
         tempfile.TemporaryDirectory(prefix="screenshot-agent-") as directory,
         tempfile.TemporaryFile(mode="w+") as stderr,
@@ -22,7 +36,7 @@ def invoke(prompt, images, schema, emit, check):
         for override in (
             'approval_policy="never"',
             'sandbox_mode="read-only"',
-            'web_search="disabled"',
+            f'web_search="{"live" if web_search else "disabled"}"',
             "features.shell_tool=false",
             "features.unified_exec=false",
             "features.multi_agent=false",
@@ -140,15 +154,27 @@ def invoke(prompt, images, schema, emit, check):
                     "ephemeral": True,
                     "sandbox": "read-only",
                     "approvalPolicy": "never",
-                    **({"model": behavior()["agent"]["model"]} if behavior()["agent"].get("model") else {}),
+                    **({"model": model} if model else {}),
                 },
             )["thread"]["id"]
-            emit({"type": "status", "text": "Selecting screenshots", "thread_id": thread})
+            description = " · ".join(
+                filter(None, (status, model, f"reasoning: {reasoning_effort}" if reasoning_effort else None))
+            )
+            emit(
+                {
+                    "type": "status",
+                    "text": description,
+                    "thread_id": thread,
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                }
+            )
             request(
                 2,
                 "turn/start",
                 {
                     "threadId": thread,
+                    **({"effort": reasoning_effort} if reasoning_effort else {}),
                     "input": [
                         {"type": "text", "text": prompt},
                         *({"type": "localImage", "path": str(p)} for p in images),

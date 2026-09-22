@@ -38,3 +38,16 @@ export function outputDimensions(job: Job) {
   const height = video.height - crop.top - crop.bottom;
   return width > 0 && height > 0 ? { width, height } : null;
 }
+
+export function editableEncodingTask(job: Job) {
+  if (
+    job.state !== "ENCODING" ||
+    !job.encode_config ||
+    job.encode_config.data.execution_mode === "smoke"
+  )
+    return undefined;
+  const { task } = recordedEncodingCommand(job);
+  return task && ["QUEUED", "CANCELLED", "FAILED"].includes(task.status)
+    ? task
+    : undefined;
+}

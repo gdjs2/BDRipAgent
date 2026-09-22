@@ -18,7 +18,7 @@ export function EncodingPauseButton({ task }: { task: EncodingPauseTask }) {
   return (
     <div className="encoding-pause-control">
       <button
-        className="secondary"
+        className={`secondary ${pause.status === "Paused" ? "needs-input" : ""}`}
         disabled={change.isPending || pause.disabled}
         onClick={() => change.mutate(pause.action)}
       >

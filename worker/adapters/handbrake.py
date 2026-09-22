@@ -122,4 +122,6 @@ def parse_progress(text):
         result["pass_eta_seconds" if "pass_count" in result else "eta_seconds"] = (
             int(eta[1]) * 3600 + int(eta[2]) * 60 + int(eta[3])
         )
+    if result["percentage"] >= 100:
+        result.update(indeterminate=True, phase="Finalizing encoded file")
     return result

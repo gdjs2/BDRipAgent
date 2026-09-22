@@ -3,7 +3,7 @@
 import re
 import unicodedata
 
-import pycountry
+from langcodes import Language
 
 
 def source_description(name: str) -> str:
@@ -21,15 +21,14 @@ def source_description(name: str) -> str:
 
 
 def language_name(code):
-    code = (code or "und").split("-")[0].lower()
+    code = code or "und"
     if code == "und":
         return "Undetermined"
-    language = (
-        pycountry.languages.get(alpha_2=code)
-        if len(code) == 2
-        else (pycountry.languages.get(alpha_3=code) or pycountry.languages.get(bibliographic=code))
-    )
-    return language.name if language else code
+    try:
+        language = Language.get(code)
+        return language.display_name("en") if language.is_valid() else code
+    except ValueError:
+        return code
 
 
 def audio_description(track):

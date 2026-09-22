@@ -1,6 +1,7 @@
 import json
 import re
 
+from shared.media_details import video_bitrate
 from shared.naming import track_name
 from worker.adapters.handbrake import parse_scan
 
@@ -68,19 +69,24 @@ def video_metadata(probe):
         "pix_fmt": v.get("pix_fmt"),
         "field_order": v.get("field_order"),
         "frame_count": int(v["nb_frames"]) if str(v.get("nb_frames", "")).isdigit() else None,
-        "bit_rate": int(v.get("bit_rate") or probe["format"].get("bit_rate", 0)),
+        "bit_rate": video_bitrate(probe),
+        "bit_rate_scope": "video",
     }
 
 
 def analyze(ctx):
     source = ctx.source()
+    ctx.progress(None, phase="Reading container tracks")
     mkv_path = ctx.output("metadata", "mkvmerge.json")
     mkv = json.loads(ctx.run([ctx.settings.mkvmerge_bin, "-J", source], output=mkv_path))
     ctx.artifact(mkv_path, "SOURCE_METADATA")
+    ctx.progress(10, phase="Reading media information", indeterminate=True)
     info_path = ctx.output("metadata", "mediainfo.json")
     media_info = json.loads(ctx.run([ctx.settings.mediainfo_bin, "--Output=JSON", source], output=info_path))
     ctx.artifact(info_path, "SOURCE_METADATA")
+    ctx.progress(20, phase="Probing video streams", indeterminate=True)
     ff = probe(ctx, source)
+    ctx.progress(30, phase="Scanning video previews and crop", indeterminate=True)
     scan_path = ctx.output("metadata", "handbrake-scan.txt")
     # HandBrake writes JSON to stdout and diagnostics to stderr. Merging them
     # can insert a diagnostic into a JSON string, especially with many tracks.
@@ -99,8 +105,10 @@ def analyze(ctx):
         output=scan_path,
     )
     ctx.artifact(scan_path, "SOURCE_METADATA")
+    ctx.progress(95, phase="Checking source properties")
     crop = parse_scan(scan)
     video = video_metadata(ff)
+    video["bit_rate"] = video_bitrate(ff, media_info, mkv)
     crop.dimensions(video["width"], video["height"])
     if video["sample_aspect_ratio"] not in ["1:1", "N/A"]:
         raise ValueError("Anamorphic source needs an explicit pixel-aspect policy; V1 accepts square pixels")
@@ -115,8 +123,12 @@ def analyze(ctx):
         raise ValueError(
             "Selected profile would reduce source bit depth; create a job with a suitable profile"
         )
+    videos = [t for t in mkv["tracks"] if t["type"] == "video"]
+    if len(videos) != 1:
+        raise ValueError("Source must contain exactly one MKV video track")
+    video["track_id"] = videos[0]["id"]
     tracks = []
-    for t in mkv["tracks"]:
+    for source_order, t in enumerate(mkv["tracks"]):
         if t["type"] not in ["audio", "subtitles"]:
             continue
         p = t.get("properties", {})
@@ -147,7 +159,9 @@ def analyze(ctx):
         tracks.append(
             {
                 "track_id": t["id"],
+                "source_order": source_order,
                 "ffprobe_index": s.get("index"),
+                "start_time": float(s.get("start_time") or 0),
                 "kind": t["type"],
                 "codec": t["codec"],
                 "codec_id": codec_id,

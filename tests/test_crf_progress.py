@@ -137,10 +137,14 @@ sys.exit(code)
                 ctx, profiles()["x264-live"], Crop(top=104, bottom=104, left=0, right=0)
             )
             assert [p["crf"] for p in result["samples"]] == [13, 20]
-        assert any(row["progress"] == 37 and row["progress_detail"]["frames"] == 12 for row in observed)
-        assert observed[-1]["progress_detail"]["stage"] == ("failed" if exit_code else "complete")
-        assert observed[-1]["progress"] == (25 if exit_code else 99)
-        assert observed[-1]["progress_detail"]["elapsed_seconds"] > 0
+        assert any(
+            row["progress"] == pytest.approx(37 * 0.95) and row["progress_detail"]["frames"] == 12
+            for row in observed
+        )
+        assert observed[-1]["progress_detail"]["stage"] == ("failed" if exit_code else "saving")
+        assert observed[-1]["progress"] == pytest.approx(37 * 0.95 if exit_code else 95)
+        assert any(row["progress_detail"].get("elapsed_seconds", 0) > 0 for row in observed)
+        assert all(row["progress"] < 100 for row in observed)
         with session() as db:
             events = db.scalars(
                 select(Event).where(Event.job_id == new_job["id"], Event.type == "task_progress")

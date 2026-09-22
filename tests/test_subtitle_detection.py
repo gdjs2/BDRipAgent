@@ -138,7 +138,7 @@ def test_detected_language_names_and_sdh_flags(code, label):
 @pytest.fixture
 def context(environment, tmp_path, monkeypatch):
     data = report()
-    events, artifacts, commands = [], [], []
+    events, artifacts, commands, updates = [], [], [], []
     root = tmp_path / "workspace"
     root.mkdir()
 
@@ -149,7 +149,12 @@ def context(environment, tmp_path, monkeypatch):
         (cache / "sheet-00.jpg").write_bytes(b"image")
         callback = kwargs["progress_parser"]
         assert callback("SUBTITLE_O") is None
-        assert callback("CR 6/6\n")["percentage"] == 99
+        update = callback("CR 6/6\n")
+        if update:  # Standalone preparation publishes through TaskContext.run.
+            ctx.progress(update.pop("percentage"), **update)
+        value, detail = updates[-1]
+        assert detail.get("phase_percentage", value) == 95
+        assert detail["completed_cues"] == detail["total_cues"] == 6
 
     ctx = SimpleNamespace(
         settings=environment,
@@ -158,7 +163,7 @@ def context(environment, tmp_path, monkeypatch):
         workspace=root,
         run=run,
         check=lambda: None,
-        progress=lambda *a, **kw: None,
+        progress=lambda value, **detail: updates.append((value, detail)),
         log=lambda message: events.append(message),
         output=lambda category, name: root / name,
         artifact=lambda path, kind, **kw: artifacts.append((path, kind)),
@@ -279,16 +284,11 @@ def test_subtitle_endpoint_auth_streaming_and_busy_lock(environment, monkeypatch
     headers = {"Authorization": f"Bearer {environment.agent_token}"}
     with TestClient(service.app) as client:
         assert client.post("/classify-subtitles", json=body).status_code == 401
-        service.lock.acquire()
-        try:
-            assert client.post("/classify-subtitles", json=body, headers=headers).status_code == 409
-        finally:
-            service.lock.release()
         response = client.post("/classify-subtitles", json=body, headers=headers)
         assert response.status_code == 200
         messages = [json.loads(line) for line in response.text.splitlines()]
         assert any(m["type"] == "prompt" for m in messages) and messages[-1]["type"] == "result"
-        assert not service.lock.locked()
+        assert service.agent_queue.snapshot() == {"running": 0, "waiting": 0}
         assert (
             client.post("/classify-subtitles", json={**body, "track_id": -1}, headers=headers).status_code
             == 422
@@ -390,3 +390,29 @@ def test_busy_agent_waits_for_other_jobs_without_using_network_retry_budget(cont
     monkeypatch.setattr(subtitles.time, "sleep", lambda seconds: None)
     assert subtitles.review(ctx) == {"tracks": []}
     assert calls == ["/review-tracks"] * 6
+
+
+def test_completed_ocr_evidence_is_reused_after_a_new_task_attempt(context):
+    ctx, track, data, _, commands = context
+    source = ctx.workspace / "original.sup"
+    source.write_bytes(b"PGS fixture")
+    original_run = ctx.run
+
+    def run(args, **kwargs):
+        original_run(args, **kwargs)
+        for sample in data["samples"]:
+            (args[3] / sample["image"]).write_bytes(b"image")
+
+    ctx.run = run
+    first = subtitles.prepare(ctx, track, source)
+    assert len(commands) == 1
+    ctx.task_id = str(uuid4())
+    second = subtitles.prepare(ctx, track, source)
+    assert len(commands) == 1 and first[0] != second[0]
+    assert (second[0] / data["samples"][0]["image"]).read_bytes() == b"image"
+    (first[0] / data["samples"][0]["image"]).unlink()
+    # A valid cache published by the original attempt must still be usable if
+    # the source evidence exists; missing images trigger a local reread only.
+    ctx.task_id = str(uuid4())
+    subtitles.prepare(ctx, track, source)
+    assert len(commands) == 2

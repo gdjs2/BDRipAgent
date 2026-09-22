@@ -80,14 +80,18 @@ def main():
             workspace=root,
             source=lambda: source,
             job=SimpleNamespace(
-                release_name="Fixture.2026.1080p.BluRay.x264-WiKi",
+                title="Amélie: A Film",
+                year=2001,
+                release_name="Amelie.A.Film.2001.1080p.BluRay.x264-WiKi",
                 analysis={"prepared_tracks": tracks, "encoded_path": video.name},
                 validation={"metrics": {"source_first_pts": 0, "encoded_first_pts": 0}},
             ),
         )
         final = root / "final.mkv"
         run(mux_command(ctx, final))
-        actual = json.loads(run(["mkvmerge", "-J", final]))["tracks"][1:]
+        inspection = json.loads(run(["mkvmerge", "-J", final]))
+        assert inspection["container"]["properties"]["title"] == "Amélie: A Film (2001)"
+        actual = inspection["tracks"][1:]
         mapping = {
             "default": "default_track",
             "forced": "forced_track",

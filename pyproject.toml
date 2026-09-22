@@ -9,7 +9,7 @@ dependencies = [
   "pydantic-settings>=2.7,<3", "sqlalchemy>=2.0,<3", "alembic>=1.14,<2",
   "psycopg[binary]>=3.2,<4", "celery[redis]>=5.4,<6",
   "httpx>=0.28,<1", "PyYAML>=6,<7", "Pillow>=11,<13",
-  "numpy>=2,<3", "av>=14,<17", "pycountry>=24,<27", "imdbinfo==0.9.1",
+  "numpy>=2,<3", "av>=14,<17", "pysubs2==1.8.0", "pycountry>=24,<27", "langcodes[data]>=3.5,<4", "imdbinfo==0.9.1",
 ]
 
 [dependency-groups]

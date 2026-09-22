@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from backend.app.movie_metadata import normalize_imdb_id
 from shared.config import ScreenshotDecoder, ScreenshotPolicy
 from shared.encoding import EncodeTarget
+from shared.languages import language_tag
+from shared.subtitle_discovery import DiscoveryPolicy
 from shared.tracks import FLAG_NAMES
 
 
@@ -21,6 +23,8 @@ class CreateJob(StrictModel):
     imdb_id: str | None = None
     analysis_profile: str = "x265-live"
     screenshot_policy: ScreenshotPolicy | None = None
+    subtitle_discovery: DiscoveryPolicy = Field(default_factory=DiscoveryPolicy)
+    audio_review_max_rounds: int | None = Field(default=None, ge=1, le=30, strict=True)
 
     @field_validator("title")
     @classmethod
@@ -48,10 +52,21 @@ class CreatePair(CreateJob):
 
 
 class SelectTracks(StrictModel):
-    audio_track_ids: list[int]
-    subtitle_track_ids: list[int]
+    shared_revision: int | None = Field(default=None, ge=0, strict=True)
+    audio_track_ids: list[int] = Field(
+        description="Selected audio track IDs in final output order, after video"
+    )
+    subtitle_track_ids: list[int] = Field(
+        description="Selected subtitle track IDs in final output order, after audio"
+    )
     track_names: dict[int, str] = Field(default_factory=dict)
     track_flags: dict[int, dict[str, bool]] = Field(default_factory=dict)
+    track_languages: dict[int, str] = Field(default_factory=dict)
+
+    @field_validator("track_languages")
+    @classmethod
+    def valid_languages(cls, value):
+        return {track_id: language_tag(code.strip()) for track_id, code in value.items()}
 
     @field_validator("track_flags", mode="before")
     @classmethod
@@ -87,10 +102,10 @@ class SelectTracks(StrictModel):
 
     @model_validator(mode="after")
     def names_for_selected_tracks(self):
-        if (self.track_names.keys() | self.track_flags.keys()) - set(
+        if (self.track_names.keys() | self.track_flags.keys() | self.track_languages.keys()) - set(
             self.audio_track_ids + self.subtitle_track_ids
         ):
-            raise ValueError("Custom names and flags may only be supplied for selected tracks")
+            raise ValueError("Custom names, flags, and languages may only be supplied for selected tracks")
         return self
 
     @field_validator("audio_track_ids", "subtitle_track_ids")
@@ -118,6 +133,14 @@ class SelectScreenshotDecoder(StrictModel):
     decoder: ScreenshotDecoder
 
 
+class SelectScreenshotBestCount(StrictModel):
+    best_count: int = Field(ge=2, le=40, strict=True)
+
+
+class ReviewScreenshots(StrictModel):
+    best_count: int | None = Field(default=None, ge=2, le=40, strict=True)
+
+
 class SelectScreenshots(StrictModel):
     candidate_ids: list[StrictInt] = Field(min_length=1, max_length=15)
 
@@ -130,7 +153,7 @@ class SelectScreenshots(StrictModel):
 
 
 class CurateScreenshots(SelectScreenshots):
-    candidate_ids: list[StrictInt] = Field(max_length=15)
+    candidate_ids: list[StrictInt] = Field(max_length=40)
 
 
 class ReleaseSource(StrictModel):
@@ -151,15 +174,16 @@ class ReleaseDetails(ReleaseSource):
     upload_screenshots: bool = Field(default=False, strict=True)
     chinese_name: str = Field(min_length=1, max_length=300)
     extra_description: str = Field(default="", max_length=6000)
+    movie_description: str = Field(default="", max_length=100000)
     tracker: str = Field(min_length=1, max_length=4096)
 
-    @field_validator("chinese_name", "extra_description", "tracker")
+    @field_validator("chinese_name", "extra_description", "movie_description", "tracker")
     @classmethod
     def clean_text(cls, value, info):
         value = value.strip()
         if any(ord(c) < 32 and c not in "\n\t" for c in value):
             raise ValueError("Text contains unsupported control characters")
-        if info.field_name != "extra_description" and not value:
+        if info.field_name not in ("extra_description", "movie_description") and not value:
             raise ValueError("This field is required")
         return value
 
@@ -176,8 +200,14 @@ class ReleaseDetails(ReleaseSource):
         return value
 
 
+class SaveReleaseDetails(ReleaseDetails):
+    shared_revision: int | None = Field(default=None, ge=0, strict=True)
+
+
 class UpdateQueue(StrictModel):
-    max_concurrent_jobs: int | None = Field(default=None, ge=1, le=64, strict=True)
+    max_encoding_tasks: int | None = Field(default=None, ge=1, le=64, strict=True)
+    max_crf_tasks: int | None = Field(default=None, ge=1, le=64, strict=True)
+    max_other_tasks: int | None = Field(default=None, ge=1, le=64, strict=True)
     paused: bool | None = Field(default=None, strict=True)
 
 

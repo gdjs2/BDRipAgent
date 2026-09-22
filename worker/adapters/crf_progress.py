@@ -31,7 +31,11 @@ def normalize_progress(data):
     # but reserve 100% for successful process exit AND accepted analysis results.
     fraction = detail["sample_fraction"] if data.get("state") == "running" else 0
     percentage = min(99, int(100 * (detail["completed"] + fraction) / total)) if total else 0
-    return {"percentage": percentage, **detail}
+    return {
+        "percentage": percentage,
+        **detail,
+        "indeterminate": not total or detail["flushing"] or data.get("state") == "complete",
+    }
 
 
 class CRFProgressReader:

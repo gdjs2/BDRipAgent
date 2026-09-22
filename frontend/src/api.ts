@@ -78,6 +78,67 @@ export async function api<T>(
 export const readable = (value: string) =>
   value.toLowerCase().replaceAll("_", " ");
 export const size = (n: number) =>
-  n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : `${(n / 1e6).toFixed(1)} MB`;
+  n >= 1e9
+    ? `${(n / 1e9).toFixed(2)} GB`
+    : n >= 1e6
+      ? `${(n / 1e6).toFixed(1)} MB`
+      : n >= 1e3
+        ? `${(n / 1e3).toFixed(1)} KB`
+        : `${n} B`;
 export const clock = (seconds: number) =>
   new Date(Math.max(0, seconds) * 1000).toISOString().slice(11, 19);
+
+// Send the file directly; a separate JSON API would buffer or base64-expand it.
+export function uploadSubtitle(
+  jobId: string,
+  file: File,
+  code: string,
+  hearingImpaired: boolean,
+  onProgress: (value: number | null) => void,
+): Promise<{ duplicate: boolean; queued?: boolean }> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    const params = new URLSearchParams({
+      filename: file.name,
+      code,
+      hearing_impaired: String(hearingImpaired),
+    });
+    request.open("POST", `/api/jobs/${jobId}/tracks/upload?${params}`);
+    request.setRequestHeader("Content-Type", "application/octet-stream");
+    request.timeout = 10 * 60 * 1000;
+    request.upload.onprogress = (event) =>
+      onProgress(
+        event.lengthComputable ? (event.loaded / event.total) * 100 : null,
+      );
+    request.onerror = request.ontimeout = () =>
+      reject(
+        new ApiError(
+          "Upload interrupted. You can retry the same file safely.",
+          null,
+          true,
+        ),
+      );
+    request.onload = () => {
+      let result: { detail?: string; duplicate: boolean };
+      try {
+        result = JSON.parse(request.responseText);
+      } catch {
+        result = { duplicate: false };
+      }
+      if (request.status >= 200 && request.status < 300) resolve(result);
+      else {
+        if (request.status === 401)
+          window.dispatchEvent(new Event("session-expired"));
+        reject(
+          new ApiError(
+            typeof result.detail === "string"
+              ? result.detail
+              : `Upload failed (${request.status}).`,
+            request.status,
+          ),
+        );
+      }
+    };
+    request.send(file);
+  });
+}

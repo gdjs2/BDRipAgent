@@ -11,10 +11,11 @@ from shared.config import profiles
 from shared.db import session
 from shared.encoding import is_smoke_test
 from shared.models import Task
-from shared.paths import contained, job_dir, write_json
+from shared.paths import artifact_root, contained, job_dir, write_json
 from shared.release import selected_pairs
 from worker.adapters.release_progress import ReleaseProgressReader
 from worker.pipeline.release_exports import publish, release_paths, validate_name
+from worker.progress import plan
 
 
 def generate(ctx):
@@ -71,23 +72,36 @@ def generate(ctx):
             else None,
         },
     )
-    ctx.progress(0, phase="Preparing release")
-    ctx.run(
+    steps = plan(ctx, files=75, publication=25)
+    steps["files"].progress(None, phase="Preparing release")
+    steps["files"].run(
         [ctx.settings.bdrip_python, Path(__file__).parents[1] / "adapters/release_runner.py", request],
         progress_reader=ReleaseProgressReader(progress),
         env={"TU_TTG_TOKEN": ctx.settings.tu_ttg_token.get_secret_value()},
     )
     result = json.loads(output.read_text())
     artifacts = []
-    ctx.progress(99, phase="Preparing release ART directory")
-    exported = publish(ctx, result.pop("artifacts"))
+    steps["files"].done("Release files generated and verified")
+    steps["publication"].progress(None, phase="Preparing release ART directory")
+    staging = {item["kind"]: item for item in result.pop("artifacts")}
+    exported = publish(steps["publication"], list(staging.values()))
     for item in exported:
         # The bridge runs locally; paths still must belong to configured storage.
         relative = ctx.artifact(
             Path(item["path"]),
             item["kind"],
             storage=item["storage"],
-            info={"smoke_test": is_smoke_test(ctx.job)},
+            info={
+                "smoke_test": is_smoke_test(ctx.job),
+                "staging": {
+                    "storage": staging[item["kind"]]["storage"],
+                    "path": str(
+                        Path(staging[item["kind"]]["path"]).relative_to(
+                            artifact_root(ctx.settings, ctx.job.id, staging[item["kind"]]["storage"])
+                        )
+                    ),
+                },
+            },
         )
         artifacts.append({"path": relative, "kind": item["kind"], "storage": item["storage"]})
     result["artifacts"] = artifacts
@@ -100,6 +114,10 @@ def generate(ctx):
     ctx.artifact(output, "RELEASE_REPORT")
 
     def save(db, job):
+        from worker.output_backups import retire_outputs
+        from worker.pipeline.release_exports import KINDS
+
         job.analysis = {**job.analysis, "release_result": result}
+        retire_outputs(db, job, kinds=KINDS, keep_paths={(a["storage"], a["path"]) for a in artifacts})
 
     return save

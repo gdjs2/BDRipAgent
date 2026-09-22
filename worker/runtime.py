@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import signal
@@ -89,6 +90,7 @@ class TaskContext:
         self.settings = get_settings()
         self.stopped = threading.Event()
         self.lost = threading.Event()
+        self.local_cancel = threading.Event()
         with session() as db:
             task = db.get(Task, task_id)
             self.job = db.get(MovieJob, task.job_id)
@@ -115,8 +117,14 @@ class TaskContext:
                 return
 
     def check(self):
-        if self.lost.is_set():
+        if self.lost.is_set() or self.local_cancel.is_set():
             raise Interrupted("Task cancelled or worker lease lost")
+
+    def branch(self):
+        """An independently cancellable preparation lane sharing the task lease."""
+        child = copy.copy(self)
+        child.local_cancel = threading.Event()
+        return child
 
     def close(self):
         self.stopped.set()
@@ -145,7 +153,11 @@ class TaskContext:
             if task.status != "RUNNING" or task.run_token != self.token or task.cancel_requested:
                 self.lost.set()
                 self.check()
-            task.progress = max(0, min(100, value))
+            if value is None:
+                detail.setdefault("indeterminate", True)
+            else:
+                # Only the worker's successful commit may publish 100%.
+                task.progress = max(0, min(99.9, value))
             task.progress_detail = detail
             task.heartbeat_at = now()
             event(db, task.job_id, "task_progress", task_id=task.id, progress=task.progress, **detail)
