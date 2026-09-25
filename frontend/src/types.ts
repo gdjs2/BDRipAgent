@@ -11,6 +11,7 @@ export type Profile = {
   crf_max?: number;
 };
 export type Policy = {
+  strategy?: "local" | "agent";
   best_count?: number;
   decoder?: "cpu" | "cuda";
   count: number;
@@ -91,6 +92,7 @@ export type SubtitleDiscovery = {
     detail: { phase?: string };
   } | null;
   report?: {
+    task_id?: string;
     status: string;
     summary: string;
     original_languages: string[];
@@ -116,6 +118,7 @@ export type Track = {
   track_id: number;
   kind: string;
   info: {
+    original?: boolean | null;
     source_order?: number;
     origin?: "upload" | "discovery";
     discovery?: DiscoveredSubtitle;
@@ -239,9 +242,11 @@ export type AudioComparison = {
   }[];
 };
 export type Job = {
+  original_languages?: { code: string; name: string }[];
   shared_track_selection?: {
     revision: number;
     applied_revision: number;
+    remux_pending?: boolean;
     source_job_id: string;
     updated_at: string;
     pending: boolean;
@@ -276,6 +281,19 @@ export type Job = {
   artifacts: Artifact[];
   screenshot_policy: Policy;
   analysis: {
+    screenshot_more?: {
+      requested: number;
+      added: number;
+      candidate_ids: number[];
+      warning?: string | null;
+    };
+    screenshot_review?: {
+      strategy: "local" | "agent";
+      requested: number;
+      available: number;
+      candidate_count: number;
+      warning?: string | null;
+    };
     track_review_version?: number;
     remux_revision?: { id: string; requested_at: string };
     audio_comparison?: AudioComparison;

@@ -320,7 +320,7 @@ def test_shortlist_can_keep_40_from_95_sparse_candidates(environment, tmp_path, 
             {
                 "candidates": candidates,
                 "contact_sheets": sheets,
-                "policy": ScreenshotPolicy().model_dump(),
+                "policy": ScreenshotPolicy(best_count=15).model_dump(),
                 "duration": 9600,
             }
         )
@@ -438,8 +438,9 @@ def test_best_count_cannot_change_during_running_review(client, review_job):
     assert client.get(f"/api/jobs/{review_job}").json()["screenshot_policy"]["best_count"] == 20
 
 
-def test_new_jobs_default_to_twenty_best_candidates(new_job):
-    assert new_job["screenshot_policy"]["best_count"] == 20
+def test_new_jobs_default_to_local_with_thirty_best_candidates(new_job):
+    assert new_job["screenshot_policy"]["best_count"] == 30
+    assert new_job["screenshot_policy"]["strategy"] == "local"
 
 
 def test_best_count_falls_back_to_available_candidates():

@@ -11,6 +11,7 @@ from shared.languages import language_tag
 from shared.media_details import encoder_summary
 from shared.models import CRFResult, EncodeConfig, MovieJob, MovieTrack, TrackSelection
 from shared.naming import release_name, track_name
+from shared.original_languages import is_original, movie_languages
 from shared.paths import contained, job_dir, write_json
 from shared.subtitles import SUBTITLE_ANALYSIS_VERSION, subtitle_is_resolved
 from worker.adapters.handbrake import Crop, encode_command, parse_progress
@@ -324,6 +325,7 @@ def mux_command(ctx, output):
     video = source if smoke else contained(ctx.workspace, ctx.job.analysis["encoded_path"], exists=True)
     video_id = ctx.job.analysis["smoke_video_track_id"] if smoke else 0
     tracks = ctx.job.analysis["prepared_tracks"]
+    originals = movie_languages(ctx.job.analysis, metadata=getattr(ctx.job, "imdb_metadata", None))
     metrics = ctx.job.validation["metrics"]
     video_offset_ms = (metrics["source_first_pts"] - metrics["encoded_first_pts"]) * 1000
     command = [
@@ -335,6 +337,8 @@ def mux_command(ctx, output):
         f"{ctx.job.title} ({ctx.job.year})",
         "--track-name",
         f"{video_id}:SMOKE TEST - Source reused" if smoke else f"{video_id}:",
+        "--original-flag",
+        f"{video_id}:1",
         "--video-tracks",
         str(video_id),
         "--no-audio",
@@ -363,6 +367,8 @@ def mux_command(ctx, output):
             f"0:{int(track.get('visual_impaired', False))}",
             "--commentary-flag",
             f"0:{int(track.get('commentary', False))}",
+            "--original-flag",
+            f"0:{int(is_original(track, originals))}",
         ]
         if track.get("timestamps"):
             command += ["--timestamps", f"0:{contained(ctx.workspace, track['timestamps'], exists=True)}"]
@@ -381,6 +387,12 @@ def mux_command(ctx, output):
 
 
 def mux(ctx):
+    # Legacy prepared jobs may predate the source-wide movie-language snapshot.
+    if "original_languages" not in ctx.job.analysis:
+        from backend.app.track_choices import original_languages
+
+        with session() as db:
+            ctx.job.analysis = {**ctx.job.analysis, "original_languages": original_languages(db, ctx.job)}
     smoke = is_smoke_test(ctx.job)
     smoke_ready = (
         ctx.job.analysis.get("encoding_skipped") is True
@@ -411,7 +423,7 @@ def mux(ctx):
             step = detections[str(track["track_id"])]
             track = classify_subtitle(step, track, contained(ctx.workspace, track["path"], exists=True))
             step.done("Subtitle analysis ready")
-        prepared.append(track)
+        prepared.append({**track, "original": is_original(track, movie_languages(ctx.job.analysis))})
     ctx.job.analysis = {**ctx.job.analysis, "prepared_tracks": prepared}
     directory = job_dir(ctx.settings.completed_root, ctx.job.id)
     revision = ctx.job.analysis.get("remux_revision")
@@ -429,6 +441,8 @@ def mux(ctx):
         {
             "video": ctx.job.source_path if smoke else ctx.job.analysis["encoded_path"],
             "smoke_test": smoke,
+            "original_languages": movie_languages(ctx.job.analysis),
+            "video_original": True,
             "tracks": ctx.job.analysis["prepared_tracks"],
             "chapters_and_global_tags_from": ctx.job.source_path,
             "argv": command,
@@ -448,6 +462,8 @@ def mux(ctx):
         raise ValueError("Final mux track count does not match mux plan")
     if inspection["container"]["properties"].get("title") != f"{ctx.job.title} ({ctx.job.year})":
         raise ValueError("Final mux title does not match the movie title and year")
+    if not inspection["tracks"][0]["properties"].get("flag_original"):
+        raise ValueError("Final mux video is missing the original-language flag")
     for actual, expected in zip(inspection["tracks"][1:], ctx.job.analysis["prepared_tracks"], strict=True):
         p = actual["properties"]
         if p.get("track_name") != track_name(expected):
@@ -463,6 +479,7 @@ def mux(ctx):
             ("flag_hearing_impaired", "hearing_impaired"),
             ("flag_commentary", "commentary"),
             ("flag_visual_impaired", "visual_impaired"),
+            ("flag_original", "original"),
         ):
             if bool(p.get(flag, False)) != bool(expected.get(key, False)):
                 raise ValueError(f"Final mux did not preserve {key}")
@@ -475,7 +492,11 @@ def mux(ctx):
 
         save_prepared_tracks(db, job, prepared)
         final_path = str(output.relative_to(ctx.settings.completed_root))
-        job.analysis = {**job.analysis, "final_path": final_path}
+        job.analysis = {
+            **job.analysis,
+            "final_path": final_path,
+            "mux_original_languages": movie_languages(ctx.job.analysis),
+        }
         retire_outputs(db, job, kinds={"FINAL_MKV", "SMOKE_TEST_MKV"}, keep_paths={("completed", final_path)})
 
     return save
@@ -505,7 +526,14 @@ def generate_release(ctx):
     return generate(ctx)
 
 
+def sync_screenshots(ctx):
+    from worker.pipeline.screenshots import sync_shared_pool
+
+    return sync_shared_pool(ctx)
+
+
 HANDLERS = {
+    "sync_screenshots": sync_screenshots,
     "discover_subtitles": discover_subtitles,
     "review_uploaded_subtitle": review_uploaded_subtitle,
     "analyze": analyze_source,

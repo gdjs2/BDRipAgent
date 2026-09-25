@@ -7,7 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from backend.app.track_choices import source_key
-from shared.config import behavior
+from shared.config import subtitle_processing_timeout_seconds
 from shared.db import session
 from shared.models import SourceTrackChoices, Task
 from shared.paths import contained
@@ -36,14 +36,19 @@ def review_uploaded_subtitle(ctx):
         )
     if not entry:
         raise ValueError("The original subtitle upload is not available")
-    deadline = time.monotonic() + behavior()["integrations"]["subtitle_discovery"].get("max_seconds", 1800)
+    timeout = subtitle_processing_timeout_seconds()
+    deadline = time.monotonic() + timeout
     ctx = ctx.branch()
     original_check = ctx.check
 
     def check():
         original_check()
         if time.monotonic() > deadline:
-            raise TimeoutError("Uploaded subtitle review reached its time limit; retry the review if needed")
+            raise TimeoutError(
+                f"Uploaded subtitle review reached its {timeout / 3600:g}-hour time limit; "
+                "increase integrations.subtitle_review.max_seconds in config/application.yaml "
+                "and retry the review if needed"
+            )
 
     ctx.check = check
     references = source_references(ctx)

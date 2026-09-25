@@ -41,7 +41,7 @@ env_temporary="$(mktemp "$project_root/.env.startup.XXXXXX")"
 trap 'rm -f -- "$env_temporary"' EXIT
 # Treat .env as data, never as executable shell code. Preserve custom values,
 # comments and settings; only fill missing, empty or example secret values.
-awk '
+awk -v app_uid="${APP_UID:-${SUDO_UID:-$(id -u)}}" -v app_gid="${APP_GID:-${SUDO_GID:-$(id -g)}}" '
   function fresh(    command, value, result) {
     command = "openssl rand -hex 32"
     result = (command | getline value)
@@ -61,6 +61,16 @@ awk '
     key = $0
     sub(/^[ \t]*(export[ \t]+)?/, "", key)
     sub(/[ \t]*=.*/, "", key)
+    if ((key == "APP_UID" || key == "APP_GID") && $0 ~ /=/) {
+      ids[key] = 1
+      value = $0
+      sub(/^[^=]*=[ \t]*/, "", value)
+      sub(/[ \t]+#.*/, "", value)
+      if (value == "" || value == "\"\"" || value == sprintf("%c%c", 39, 39)) {
+        print key "=" (key == "APP_UID" ? app_uid : app_gid)
+        next
+      }
+    }
     if (key in wanted && $0 ~ /=/) {
       if (seen[key]++) {
         print "Duplicate setting in .env: " key > "/dev/stderr"
@@ -82,7 +92,11 @@ awk '
     print
   }
   END {
-    if (!failed) for (i = 1; i <= 3; i++) if (!seen[keys[i]]) print keys[i] "=" fresh()
+    if (!failed) {
+      for (i = 1; i <= 3; i++) if (!seen[keys[i]]) print keys[i] "=" fresh()
+      if (!("APP_UID" in ids)) print "APP_UID=" app_uid
+      if (!("APP_GID" in ids)) print "APP_GID=" app_gid
+    }
   }
 ' "$env_input" > "$env_temporary"
 if [[ ! -f .env ]] || ! cmp -s .env "$env_temporary"; then
@@ -107,6 +121,9 @@ database_password="$(setting POSTGRES_PASSWORD)"
 [[ ${#agent_token} -ge 24 ]] || fail 'AGENT_TOKEN must have at least 24 characters; check .env and exported variables.'
 [[ "$api_token" != "$agent_token" && "$api_token" != "$database_password" && "$agent_token" != "$database_password" ]] || fail 'Use different values for the three credentials.'
 [[ "$database_password" =~ ^[a-zA-Z0-9._~-]+$ ]] || fail 'Use a URL-safe POSTGRES_PASSWORD (letters, numbers, dot, underscore, tilde or hyphen).'
+app_uid="$(setting APP_UID)"
+app_gid="$(setting APP_GID)"
+[[ "$app_uid" =~ ^[0-9]+$ && "$app_gid" =~ ^[0-9]+$ && "$app_uid" -gt 0 && "$app_gid" -gt 0 ]] || fail 'Set APP_UID and APP_GID to your non-root host account (id -u and id -g).'
 storage_root="$(setting STORAGE_ROOT)"
 storage_root="${storage_root:-./data}"
 mkdir -p -m 755 -- "$storage_root/incoming" "$storage_root/jobs" "$storage_root/completed" "$storage_root/artifacts" "$storage_root/cache/agent"
@@ -147,9 +164,11 @@ with session() as db:
 fi
 
 printf 'Building application services; existing encoder containers will be preserved.\n'
-build_services=(api frontend worker crf agent)
+build_services=(api frontend worker crf agent permissions)
 if "$legacy_busy"; then build_services+=(general-upgrade); fi
 "${compose[@]}" build "${build_services[@]}"
+printf 'Preparing generated-file ownership for %s:%s (source videos are untouched).\n' "$app_uid" "$app_gid"
+"${compose[@]}" --profile maintenance run --rm --no-deps permissions
 if ! "${compose[@]}" up -d --wait --wait-timeout 180 postgres redis; then
   fail 'Inspect startup errors with: docker compose logs --tail=100 postgres redis'
 fi

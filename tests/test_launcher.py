@@ -65,6 +65,9 @@ elif 'up' in args:
     assert '--wait' in args
     sys.exit(int(os.environ.get('FAKE_UP_ERROR', '0')))
 elif 'run' in args:
+    if args[-1] == 'permissions':
+        assert '--no-deps' in args and '--rm' in args
+        sys.exit(0)
     assert args[-4:] == ['-m', 'worker.pipeline.release_migration', '--legacy-torrents', '/legacy-torrents']
     assert '--no-deps' in args and '--rm' in args
     sys.exit(int(os.environ.get('FAKE_MIGRATION_ERROR', '0')))
@@ -85,7 +88,12 @@ else:
         for k, v in os.environ.items()
         if k not in ("API_TOKEN", "AGENT_TOKEN", "POSTGRES_PASSWORD", "STORAGE_ROOT", "PORT", "BIND_ADDRESS")
     }
-    env.update(PATH=f"{binary}:{env['PATH']}", FAKE_DOCKER_LOG=str(tmp_path / "docker.log"))
+    env.update(
+        APP_UID="1004",
+        APP_GID="1005",
+        PATH=f"{binary}:{env['PATH']}",
+        FAKE_DOCKER_LOG=str(tmp_path / "docker.log"),
+    )
 
     def run(*args, **overrides):
         return subprocess.run(
@@ -204,7 +212,7 @@ def test_startup_relocates_legacy_exports_and_removes_only_empty_torrent_directo
     result = run("--no-login")
     assert result.returncode == 0, result.stderr
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    migration = next(command for command in commands if "run" in command)
+    migration = next(command for command in commands if "worker.pipeline.release_migration" in command)
     assert str(torrents) + ":/legacy-torrents" in migration
     assert not torrents.exists()
     torrents.mkdir()

@@ -66,6 +66,11 @@ def generate(ctx):
             "output_dir": str(output.parent),
             "metadata_cache": str(contained(ctx.workspace, "release-cache/movie-metadata.json")),
             "metadata_timeout": ctx.settings.imdb_timeout_seconds,
+            "release_date_cache": str(
+                contained(ctx.settings.cache_root, f"movie-release-dates/{ctx.job.imdb_id}.json")
+            )
+            if ctx.job.imdb_id
+            else None,
             "remote_suffix": f"{ctx.job.id[:8]}-{fingerprint[:12]}",
             "encoder_log": str(contained(ctx.workspace, encode_task.log_path, exists=True))
             if encode_task

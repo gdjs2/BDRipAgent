@@ -4,7 +4,7 @@ from sqlalchemy import func, or_, select, update
 
 from shared.config import get_settings
 from shared.models import MovieJob, QueueSettings, Task
-from shared.state import TRACK_TASK_STATES
+from shared.state import SCREENSHOT_SYNC_STATES, TRACK_TASK_STATES
 
 RELEASE_LIMIT = 1
 
@@ -42,6 +42,7 @@ def pending(db, *, include_held=False):
             MovieJob.deleted_at.is_(None),
             or_(
                 (Task.lane == "pipeline") & (Task.stage == MovieJob.state),
+                (Task.lane == "screenshots") & MovieJob.state.in_(SCREENSHOT_SYNC_STATES),
                 *[
                     (Task.lane == "tracks") & (Task.stage == stage) & MovieJob.state.in_(states)
                     for stage, states in TRACK_TASK_STATES.items()

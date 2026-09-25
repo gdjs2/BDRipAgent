@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy import select
 
 from shared.db import session
@@ -161,3 +162,56 @@ def test_upload_retry_cannot_overlap_another_review_for_the_source(client, new_j
     assert upload(client, other).status_code == 201
     retry = client.post(f"/api/tasks/{task_id}/retry", json={})
     assert retry.status_code == 409
+
+
+@pytest.mark.parametrize("elapsed_seconds,expected", [(2700, "SUCCEEDED"), (7201, "FAILED")])
+def test_uploaded_review_has_two_hours_for_all_cleanup_batches(
+    client, new_job, monkeypatch, elapsed_seconds, expected
+):
+    from types import SimpleNamespace
+
+    from shared.models import Task
+    from worker.pipeline import subtitle_imports
+
+    ready(new_job["id"])
+    task_id = upload(client, new_job["id"]).json()["task_id"]
+    elapsed = [0]
+    monkeypatch.setattr(subtitle_imports, "time", SimpleNamespace(monotonic=lambda: elapsed[0]))
+    monkeypatch.setattr(subtitle_imports, "source_references", lambda ctx: [{"text": "Reference dialogue"}])
+
+    def process(ctx, *args, **kwargs):
+        elapsed[0] = elapsed_seconds
+        ctx.check()
+
+    monkeypatch.setattr(subtitle_imports, "process_file", process)
+    execute(task_id)
+    with session() as db:
+        task = db.get(Task, task_id)
+        assert task.status == expected
+        if expected == "FAILED":
+            assert "2-hour time limit" in task.error_message
+            assert "integrations.subtitle_review.max_seconds" in task.error_message
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 7200), (3600, 3600), (43200, 43200), (999999, 86400), (0, 60)]
+)
+def test_subtitle_review_budget_is_independent_of_discovery(monkeypatch, value, expected):
+    from shared import config
+
+    limits = {} if value is None else {"max_seconds": value}
+    monkeypatch.setattr(
+        config,
+        "behavior",
+        lambda: {"integrations": {"subtitle_review": limits, "subtitle_discovery": {"max_seconds": 1800}}},
+    )
+    assert config.subtitle_processing_timeout_seconds() == expected
+    assert config.subtitle_processing_timeout_seconds(discovery=True) == 1800
+
+
+def test_legacy_config_keeps_separate_default_subtitle_timeouts(monkeypatch):
+    from shared import config
+
+    monkeypatch.setattr(config, "behavior", lambda: {"integrations": {}})
+    assert config.subtitle_processing_timeout_seconds() == 7200
+    assert config.subtitle_processing_timeout_seconds(discovery=True) == 1800

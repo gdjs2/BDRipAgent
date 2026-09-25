@@ -7,9 +7,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=uv /uv /usr/local/bin/uv
 COPY --from=codex /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex && useradd --create-home --uid 1000 agent && mkdir /auth && chown agent:agent /auth
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN test "$APP_UID" -gt 0 && test "$APP_GID" -gt 0 && \
+    ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex && \
+    groupadd --non-unique --gid "$APP_GID" agent && \
+    useradd --non-unique --create-home --uid "$APP_UID" --gid "$APP_GID" agent && \
+    mkdir /auth && chown agent:agent /auth
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 PATH="/app/.venv/bin:$PATH" CODEX_HOME=/auth
+ENV HOME=/auth PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/app/.venv/bin:$PATH" CODEX_HOME=/auth
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 COPY shared shared

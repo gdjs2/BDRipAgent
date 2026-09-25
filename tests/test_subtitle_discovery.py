@@ -581,7 +581,7 @@ def test_search_and_cleanup_enable_web_but_alignment_uses_source_evidence(tmp_pa
         modes.append(kwargs["web_search"])
         assert kwargs["model"] == "gpt-5.6-luna"
         assert kwargs["reasoning_effort"] == "low"
-        assert "source_reference_cues" in prompt and "REPAIR, DO NOT JUST REJECT" in prompt
+        assert "source_reference_cues" in prompt and "REPAIR FIRST" in prompt
         return json.dumps(answer()["decision"]), "thread"
 
     monkeypatch.setattr(agent, "invoke", clean_invoke)

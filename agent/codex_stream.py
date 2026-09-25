@@ -23,6 +23,7 @@ def invoke(
     status="Selecting screenshots",
     model=None,
     reasoning_effort=None,
+    timeout_seconds=None,
 ):
     settings = get_settings()
     options = behavior()["agent"]
@@ -84,7 +85,7 @@ def invoke(
 
         reader = threading.Thread(target=read_stdout, daemon=True)
         reader.start()
-        deadline = time.monotonic() + behavior()["agent"]["timeout_seconds"]
+        deadline = time.monotonic() + (timeout_seconds or behavior()["agent"]["timeout_seconds"])
         finals = []
         completed = None
 

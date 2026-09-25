@@ -4,7 +4,7 @@ import secrets
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from backend.app import queue
 from backend.app.agent_activity import router as agent_activity_router
+from backend.app.agent_prompts import router as agent_prompts_router
 from backend.app.auth import authenticated, issue_cookie
 from backend.app.cpu_monitor import CpuMonitor
 from backend.app.media_preview import MediaPreview
@@ -25,6 +26,7 @@ from backend.app.release_defaults import (
     seed_existing_release_details,
     store_release_details,
 )
+from backend.app.remux import sync_shared_choices
 from backend.app.schemas import (
     CreateJob,
     CreatePair,
@@ -35,11 +37,13 @@ from backend.app.schemas import (
     ReleaseSource,
     ReplaceScreenshot,
     ReviewScreenshots,
+    SampleMoreScreenshots,
     SaveReleaseDetails,
     SelectEncode,
     SelectScreenshotBestCount,
     SelectScreenshotDecoder,
     SelectScreenshots,
+    SelectScreenshotStrategy,
     SelectTracks,
     UpdateQueue,
 )
@@ -54,7 +58,8 @@ from backend.app.services import (
     serialize,
     serialize_tracks,
 )
-from backend.app.track_choices import apply_shared_choices, source_peers, store_choices, track_rows
+from backend.app.subtitle_guidance import router as subtitle_guidance_router
+from backend.app.track_choices import source_peers, store_choices, track_rows
 from shared.config import ScreenshotPolicy, behavior, get_settings, profiles
 from shared.db import get_db, session
 from shared.encoding import EncodeTarget, is_smoke_test
@@ -259,6 +264,7 @@ def imdb_metadata(imdb_id: str):
 
 
 def initialize_job(body: CreateJob, db, identity):
+    queue.settings(db, lock=True)
     settings = get_settings()
     source = contained(settings.source_root, body.source_path, exists=True)
     if source.suffix.lower() != ".mkv" or any(p.endswith(".partial") for p in Path(body.source_path).parts):
@@ -362,9 +368,10 @@ def delete_job(job_id: UUID, db: DB, confirm: str):
         task.status, task.finished_at, task.dispatched_at = "CANCELLED", now(), None
         event(db, job.id, "task_cancelled", task_id=task.id, reason="Job removed from list")
     job.deleted_at = now()
-    event(db, job.id, "job_removed", files_retained=True)
+    job.analysis = {**job.analysis, "file_cleanup": {"status": "pending"}}
+    event(db, job.id, "job_removed", files_retained=False, file_cleanup="pending")
     db.commit()
-    return {"deleted": True, "files_retained": True}
+    return {"deleted": True, "files_retained": False, "file_cleanup": "pending"}
 
 
 @api.get("/jobs/{job_id}/analysis")
@@ -484,7 +491,7 @@ def select_tracks(job_id: UUID, body: SelectTracks, db: DB):
         .execution_options(populate_existing=True)
     )
     for peer in peers:
-        if apply_shared_choices(db, peer, record):
+        if sync_shared_choices(db, peer, record):
             changed.append(peer)
     for current in changed:
         if current.state == Stage.WAITING_FOR_TRACK_SELECTION:
@@ -709,6 +716,27 @@ def screenshot_decoder(job_id: UUID, body: SelectScreenshotDecoder, db: DB):
     return job_detail(db, job)
 
 
+@api.patch("/jobs/{job_id}/screenshots/strategy")
+def screenshot_strategy(job_id: UUID, body: SelectScreenshotStrategy, db: DB):
+    queue.settings(db, lock=True)
+    job = get_job(db, str(job_id), lock=True)
+    if db.scalar(
+        select(Task.id).where(
+            Task.job_id == job.id,
+            Task.type.in_(["generate_candidates", "select_screenshots"]),
+            Task.status == "RUNNING",
+        )
+    ):
+        raise ValueError(
+            "Cancel the running screenshot task before changing strategy, then retry or refresh."
+        )
+    job.screenshot_policy = {**job.screenshot_policy, "strategy": body.strategy}
+    event(db, job.id, "screenshot_strategy_selected", strategy=body.strategy)
+    db.commit()
+    manifest(db, job)
+    return job_detail(db, job)
+
+
 @api.patch("/jobs/{job_id}/screenshots/best-count")
 def screenshot_best_count(job_id: UUID, body: SelectScreenshotBestCount, db: DB):
     job = get_job(db, str(job_id), lock=True)
@@ -804,13 +832,18 @@ def curate_screenshots(job_id: UUID, body: CurateScreenshots, db: DB):
 
 @api.post("/jobs/{job_id}/screenshots/review", status_code=202)
 def prepare_screenshot_review(job_id: UUID, db: DB, body: ReviewScreenshots | None = None):
+    queue.settings(db, lock=True)
     job = get_job(db, str(job_id), lock=True)
     if job.state not in (
+        Stage.SCREENSHOT_AGENT_SELECTION,
+        Stage.SCREENSHOT_CANDIDATE_GENERATION,
         Stage.WAITING_FOR_SCREENSHOT_SELECTION,
         Stage.WAITING_FOR_RELEASE_DETAILS,
         Stage.COMPLETE,
     ):
         raise ValueError("Wait for screenshot review before refreshing the best choices")
+    if db.scalar(select(Task.id).where(Task.job_id == job.id, Task.status.in_(["QUEUED", "RUNNING"]))):
+        raise ValueError("Wait for the current task to finish or cancel it before refreshing screenshots")
     ids = list(
         db.scalars(
             select(Screenshot.candidate_id).where(
@@ -818,17 +851,41 @@ def prepare_screenshot_review(job_id: UUID, db: DB, body: ReviewScreenshots | No
             )
         )
     )
-    if not ids:
+    if not ids and not job.analysis.get("candidate_index") and not (body and (body.resample or body.append)):
         raise ValueError("This job has no saved shortlist to review")
     if body and body.best_count is not None:
         job.screenshot_policy = {**job.screenshot_policy, "best_count": body.best_count}
-    job.analysis = {**job.analysis, "review_shortlisted_ids": ids}
-    job.state, job.completed_at = Stage.SCREENSHOT_AGENT_SELECTION.value, None
+    if body and body.strategy is not None:
+        job.screenshot_policy = {**job.screenshot_policy, "strategy": body.strategy}
+    job.analysis = {
+        **{k: v for k, v in job.analysis.items() if k != "screenshot_append"},
+        "review_shortlisted_ids": ids,
+    }
+    if body and body.append:
+        if not job.analysis.get("candidate_index"):
+            raise ValueError("Prepare the initial screenshot pool before requesting more frames")
+        job.analysis = {
+            **job.analysis,
+            "screenshot_append": {"count": body.sample_count, "batch_id": str(uuid4())},
+        }
+    job.state, job.completed_at = (
+        (
+            Stage.SCREENSHOT_CANDIDATE_GENERATION.value
+            if body and (body.resample or body.append)
+            else Stage.SCREENSHOT_AGENT_SELECTION.value
+        ),
+        None,
+    )
     event(db, job.id, "state_changed", state=job.state, review_requested=True)
     result = enqueue(db, job)
     db.commit()
     manifest(db, job)
     return serialize(result)
+
+
+@api.post("/jobs/{job_id}/screenshots/more", status_code=202)
+def more_screenshots(job_id: UUID, body: SampleMoreScreenshots, db: DB):
+    return prepare_screenshot_review(job_id, db, ReviewScreenshots(append=True, sample_count=body.count))
 
 
 @api.post("/jobs/{job_id}/screenshots/{screenshot_id}/replace")
@@ -1201,4 +1258,6 @@ async def events(job_id: UUID, request: Request, db: DB):
 
 api.include_router(media_preview_router)
 api.include_router(agent_activity_router)
+api.include_router(agent_prompts_router)
+api.include_router(subtitle_guidance_router)
 app.include_router(api)

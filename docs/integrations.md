@@ -242,15 +242,20 @@ remains a smoke job; create another job to perform real encoding.
 `Title.Year.1080p.BluRay.x265.10bit[.Audio]-WiKi`. Title punctuation becomes dots,
 Latin accents are normalized, and a usable romanized title/year are required.
 Core audio is preferred for the release token; plain Dolby Digital omits the token.
-DTS uses `.DTS`, while lossless DTS-MA uses e.g. `.DTS.MA5.1` when no core is retained.
+DTS uses `.DTS`, while lossless DTS-HD MA uses e.g. `.DTS-HD.MA5.1` when no core is retained.
 The token is calculated from the selected audio, not discarded source tracks.
 The upstream naming scheme assumes 1080p Blu-ray; other release classes remain a
 question in `open-questions.md`. The application does not upscale video to 1080p.
 
-The filename stem is the MKV container title. The encoded screenshot’s last row
+The MKV container title is `{movie name} ({year})`. The encoded screenshot’s last row
 shows the actual final MKV basename, including `.mkv`; smoke tests also identify
 the reused source. Source screenshots retain their `Source` label.
-Audio labels use e.g. `English DTS-MA 5.1` or `English Dolby Atmos 7.1`.
+Audio labels use e.g. `English DTS-HD MA 5.1` or `English Dolby Atmos 7.1`.
+The `RELEASE DATE` field in both BBCode and NFO uses the movie release date from
+metadata, with verified dates in `cache/movie-release-dates/{imdb_id}.json` taking
+precedence over regional provider results. Missing dates display `Unknown`; the
+artifact generation day is never substituted. Changing an existing NFO also
+requires updating the affected torrent pieces and stored infohash.
 Subtitle labels use e.g. `English PGS SDH Forced`; unset flags are omitted.
 Default, forced, hearing/visual impairment and commentary flags are explicitly
 written and inspected after remux. Subtitle SDH is determined from content, never

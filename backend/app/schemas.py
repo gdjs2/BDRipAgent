@@ -5,7 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from backend.app.movie_metadata import normalize_imdb_id
-from shared.config import ScreenshotDecoder, ScreenshotPolicy
+from shared.config import ScreenshotDecoder, ScreenshotPolicy, ScreenshotStrategy
 from shared.encoding import EncodeTarget
 from shared.languages import language_tag
 from shared.subtitle_discovery import DiscoveryPolicy
@@ -52,6 +52,7 @@ class CreatePair(CreateJob):
 
 
 class SelectTracks(StrictModel):
+    original_languages: list[str] | None = Field(default=None, max_length=6)
     shared_revision: int | None = Field(default=None, ge=0, strict=True)
     audio_track_ids: list[int] = Field(
         description="Selected audio track IDs in final output order, after video"
@@ -62,6 +63,13 @@ class SelectTracks(StrictModel):
     track_names: dict[int, str] = Field(default_factory=dict)
     track_flags: dict[int, dict[str, bool]] = Field(default_factory=dict)
     track_languages: dict[int, str] = Field(default_factory=dict)
+
+    @field_validator("original_languages")
+    @classmethod
+    def valid_original_languages(cls, value):
+        return (
+            list(dict.fromkeys(language_tag(code.strip()) for code in value)) if value is not None else None
+        )
 
     @field_validator("track_languages")
     @classmethod
@@ -133,11 +141,23 @@ class SelectScreenshotDecoder(StrictModel):
     decoder: ScreenshotDecoder
 
 
+class SelectScreenshotStrategy(StrictModel):
+    strategy: ScreenshotStrategy
+
+
 class SelectScreenshotBestCount(StrictModel):
     best_count: int = Field(ge=2, le=40, strict=True)
 
 
+class SampleMoreScreenshots(StrictModel):
+    count: int = Field(default=15, ge=1, le=100, strict=True)
+
+
 class ReviewScreenshots(StrictModel):
+    append: bool = False
+    sample_count: int = Field(default=15, ge=1, le=100, strict=True)
+    strategy: ScreenshotStrategy | None = None
+    resample: bool = False
     best_count: int | None = Field(default=None, ge=2, le=40, strict=True)
 
 

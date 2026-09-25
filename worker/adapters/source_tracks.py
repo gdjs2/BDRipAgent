@@ -21,7 +21,12 @@ def source_key(ctx):
     source = ctx.source()
     stat = source.stat()
     identity = [str(source.resolve()), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
-    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    if workspace := getattr(ctx, "workspace", None):
+        pointer = workspace / "metadata/source-cache-key.json"
+        if not pointer.exists():
+            write_json(pointer, {"key": key})
+    return key
 
 
 @contextmanager

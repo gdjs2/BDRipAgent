@@ -6,7 +6,8 @@ from copy import deepcopy
 
 from sqlalchemy import select
 
-from shared.config import ROOT, behavior
+from shared.agent_prompts import default_text, saved_prompts, task_prompts
+from shared.config import behavior
 from shared.db import session
 from shared.models import MovieJob
 from shared.naming import automatic_track_name, track_name
@@ -32,7 +33,8 @@ TRACK_KEYS = (
 )
 
 
-def analysis_policy(analysis):
+def analysis_policy(analysis, prompts=None):
+    prompts = prompts if prompts is not None else saved_prompts()
     config = behavior()
     audio = config.get("integrations", {}).get("audio_review", {})
     return {
@@ -56,8 +58,7 @@ def analysis_policy(analysis):
         },
         "agent_model": config.get("agent", {}).get("model"),
         "prompts": {
-            name: hashlib.sha256((ROOT / "agent/prompts" / name).read_bytes()).hexdigest()
-            for name in ("subtitle_classification.md", "track_review.md")
+            name + ".md": prompts[name]["sha256"] for name in ("subtitle_classification", "track_review")
         },
     }
 
@@ -97,10 +98,20 @@ def evidence_files(result):
 class SharedTrackAnalysis:
     def __init__(self, ctx):
         self.ctx = ctx
-        self.policy = analysis_policy(ctx.job.analysis)
+        self.prompts = task_prompts(ctx)
+        self.policy = analysis_policy(ctx.job.analysis, self.prompts)
         self.signature = hashlib.sha256(json.dumps(self.policy, sort_keys=True).encode()).hexdigest()
         self.root = ctx.settings.cache_root / "track-analysis" / source_key(ctx) / self.signature
         self.manifest = self.root / "analysis.json"
+
+    def needs_review(self, result):
+        known = result.get("track_analysis_signature")
+        if known:
+            return known != self.signature
+        return any(
+            self.prompts[key]["text"] != default_text(key)
+            for key in ("track_review", "subtitle_classification")
+        )
 
     def store(self, result, *, workspace=None, donor=None):
         if not any(
@@ -167,6 +178,7 @@ class SharedTrackAnalysis:
                     select(MovieJob)
                     .where(
                         MovieJob.id != self.ctx.job.id,
+                        MovieJob.deleted_at.is_(None),
                         MovieJob.source_path == self.ctx.job.source_path,
                         MovieJob.source_size == self.ctx.job.source_size,
                         MovieJob.source_mtime_ns == self.ctx.job.source_mtime_ns,
@@ -182,12 +194,17 @@ class SharedTrackAnalysis:
             if known and known != self.signature:
                 continue
             if not known:
+                if any(
+                    self.prompts[key]["text"] != default_text(key)
+                    for key in ("track_review", "subtitle_classification")
+                ):
+                    continue
                 # Old jobs have no configuration fingerprint: require current schemas,
                 # matching limits, and the original evidence defaults before adoption.
                 defaults = {"transcription": True, "model": "small", "sample_count": 3, "sample_seconds": 30}
                 if (
                     result.get("subtitle_analysis_version") != SUBTITLE_ANALYSIS_VERSION
-                    or analysis_policy(result) != self.policy
+                    or analysis_policy(result, self.prompts) != self.policy
                     or self.policy["subtitle_cues"] != 96
                     or self.policy["agent_model"] is not None
                     or any(self.policy["audio"][key] != expected for key, expected in defaults.items())

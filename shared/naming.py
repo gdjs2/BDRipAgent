@@ -54,7 +54,7 @@ def audio_format(track):
         return "DTS:X"
     if "dts" in name:
         if any(s in name for s in ("master audio", "xll", "dts-ma", "dts-hd ma")):
-            return "DTS-MA"
+            return "DTS-HD MA"
         return "DTS-HD HRA" if "high resolution" in name or "hra" in name else "DTS"
     if "truehd" in name or "true hd" in name or "a_truehd" in name:
         return "Dolby TrueHD"
@@ -93,8 +93,15 @@ def audio_channels(track):
     return f"{count - 1}.1" if count in (6, 8) else f"{count}.0"
 
 
+def normalize_audio_label(track, label):
+    """Upgrade the old MA abbreviation, including cached and confirmed labels."""
+    if label and track.get("kind") == "audio" and audio_format(track) == "DTS-HD MA":
+        return re.sub(r"\bDTS[ -]MA\b", "DTS-HD MA", label, flags=re.IGNORECASE)
+    return label
+
+
 def track_name(track):
-    return track.get("name_override") or automatic_track_name(track)
+    return normalize_audio_label(track, track.get("name_override")) or automatic_track_name(track)
 
 
 def automatic_track_name(track):
@@ -165,8 +172,9 @@ def release_audio_token(tracks):
     t = max(tracks, key=priority)
     fmt, layout = audio_format(t), audio_channels(t)
     layout = "" if layout == "Unknown" else layout
-    if fmt == "DTS-MA":
-        return f"DTS.MA{layout}"
+    if fmt == "DTS-HD MA":
+        # Keep the full DTS-HD MA identity in filenames as well as track labels.
+        return f"DTS-HD.MA{layout}"
     codec = {
         "Dolby Atmos": "Atmos.TrueHD",
         "Dolby TrueHD": "TrueHD",

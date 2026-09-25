@@ -78,6 +78,10 @@ def request(db, job_id, target):
         "review_shortlisted_ids",
         "screenshot_selection",
         "screenshot_scan_decoder",
+        "screenshot_shared_revision",
+        "screenshot_shared_seen",
+        "screenshot_more",
+        "screenshot_append",
         "release_result",
         "encoding_skipped",
     }

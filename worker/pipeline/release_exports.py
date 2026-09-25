@@ -102,7 +102,21 @@ def publish(ctx, items):
                 raise ValueError("Could not allocate a unique ART directory")
             write_json(
                 owner,
-                {"job_id": ctx.job.id, "release_name": name, "bundle": bundle.name, "generation": generation},
+                {
+                    "job_id": ctx.job.id,
+                    "release_name": name,
+                    "bundle": bundle.name,
+                    "generation": generation,
+                    "bundles": sorted(
+                        set(
+                            [
+                                *record.get("bundles", []),
+                                *([record["bundle"]] if record.get("bundle") else []),
+                                bundle.name,
+                            ]
+                        )
+                    ),
+                },
             )
         package = contained(bundle, name)
         destinations = []

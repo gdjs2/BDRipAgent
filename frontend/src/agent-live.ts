@@ -5,6 +5,8 @@ import {
 } from "./agent-transcript.ts";
 
 export type LiveEvent = AgentEvent & {
+  prompt_key?: string;
+  prompt_revision?: number;
   event_id: number;
   job_id: string;
   task_id: string;
@@ -18,6 +20,8 @@ export type LiveEvent = AgentEvent & {
   agent_queue_state?: string;
 };
 export type Conversation = AgentInvocation & {
+  prompt_key?: string;
+  prompt_revision?: number;
   job_id: string;
   task_id: string;
   title: string;
@@ -72,6 +76,8 @@ export function applyLiveEvent(
           : (previous?.state ?? "running");
   const run: Conversation = {
     ...parsed,
+    prompt_key: event.prompt_key ?? previous?.prompt_key,
+    prompt_revision: event.prompt_revision ?? previous?.prompt_revision,
     job_id: event.job_id,
     task_id: event.task_id,
     title: `${event.title}${event.year ? ` (${event.year})` : ""}`,

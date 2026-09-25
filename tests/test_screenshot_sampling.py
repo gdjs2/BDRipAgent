@@ -157,3 +157,21 @@ def test_sampler_refills_each_region_with_bounded_different_windows():
     assert {b for b, *_ in windows[:100]} == set(range(100))
     assert all(0 <= start <= anchor < end <= 6000 for _, start, anchor, end in windows)
     assert len({anchor for _, _, anchor, _ in windows}) == 400
+
+
+def test_extra_batch_samples_new_frames_with_unique_ids(tmp_path, sampling_source, monkeypatch):
+    from shared.config import behavior
+    from worker.pipeline import screenshots
+
+    ctx = make_context(tmp_path, sampling_source, timeline(sampling_source))
+    config = {**behavior(), "candidate_count": 8, "duplicate_hash_distance": 0}
+    monkeypatch.setattr(screenshots, "behavior", lambda: config)
+    first, _, _ = screenshots.sample_candidates(ctx)
+    original = first["candidates"]
+    old_ids = {c["candidate_id"] for c in original}
+    old_frames = {c["source_frame_number"] for c in original}
+    second, _, _ = screenshots.sample_candidates(ctx, existing=original, target=3, sampling_round=1)
+    additions = [c for c in second["candidates"] if c["candidate_id"] not in old_ids]
+    assert len(additions) == 3
+    assert all(c["source_frame_number"] not in old_frames and c["b_frames_verified"] for c in additions)
+    assert len({c["candidate_id"] for c in second["candidates"]}) == len(original) + 3

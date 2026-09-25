@@ -42,8 +42,8 @@ def test_readable_languages(code, expected):
     "track,expected",
     [
         (audio("DTS", "A_DTS"), "English DTS 5.1"),
-        (audio("DTS", "A_DTS", format_features="XLL"), "English DTS-MA 5.1"),
-        (audio("DTS-HD Master Audio", "A_DTS", channels=8, channel_layout="7.1"), "English DTS-MA 7.1"),
+        (audio("DTS", "A_DTS", format_features="XLL"), "English DTS-HD MA 5.1"),
+        (audio("DTS-HD Master Audio", "A_DTS", channels=8, channel_layout="7.1"), "English DTS-HD MA 7.1"),
         (audio("AC-3", "A_AC3"), "English Dolby Digital 5.1"),
         (audio("E-AC-3", "A_EAC3"), "English Dolby Digital Plus 5.1"),
         (
@@ -69,7 +69,7 @@ def test_subtitle_optional_flags_are_omitted_unless_set(codec, fmt):
     assert track_name({**track, "hearing_impaired": True, "forced": True}) == f"English {fmt} SDH Forced"
 
 
-def test_release_naming_matches_upstream_core_first_and_codec_rules():
+def test_release_naming_uses_full_dts_hd_ma_token_and_core_first_rules():
     dd = audio("AC-3", "A_AC3")
     ma = audio("DTS-HD Master Audio", "A_DTS", channels=8, channel_layout="7.1")
     assert (
@@ -77,7 +77,7 @@ def test_release_naming_matches_upstream_core_first_and_codec_rules():
     )
     assert (
         release_name("Amélie: A Film", 2001, "x265", [ma])
-        == "Amelie.A.Film.2001.1080p.BluRay.x265.10bit.DTS.MA7.1-WiKi"
+        == "Amelie.A.Film.2001.1080p.BluRay.x265.10bit.DTS-HD.MA7.1-WiKi"
     )
     assert release_audio_token([ma, dd]) == ""
     assert release_audio_token([audio("DTS", "A_DTS")]) == "DTS"
@@ -199,3 +199,26 @@ def test_cross_codec_reservations_and_manual_override_cannot_overlap(client, env
 
 def test_pair_creation_is_atomic_and_keeps_both_human_gates(client, environment):
     create_pair_fixture(client, environment)
+
+
+@pytest.mark.parametrize("old", ["English DTS-MA 6.1", "English DTS MA 6.1", "English DTS-HD MA 6.1"])
+def test_saved_master_audio_labels_use_full_codec_name(old):
+    assert track_name(audio("DTS-HD Master Audio", "A_DTS", name_override=old)) == "English DTS-HD MA 6.1"
+
+
+def test_master_audio_label_keeps_custom_description_and_other_formats():
+    assert (
+        track_name(audio("DTS-HD Master Audio", "A_DTS", name_override="Original mix · DTS-MA 5.1"))
+        == "Original mix · DTS-HD MA 5.1"
+    )
+    assert track_name(audio("DTS", "A_DTS", name_override="Original soundtrack")) == "Original soundtrack"
+    assert track_name(audio("DTS-HD High Resolution", "A_DTS")) == "English DTS-HD HRA 5.1"
+
+
+@pytest.mark.parametrize("codec", ["x264", "x265"])
+def test_star_wars_release_filename_keeps_full_master_audio_identity(codec):
+    ma = audio("DTS-HD Master Audio", "A_DTS", channels=7, channel_layout="6.1", format_features="ES XCh XLL")
+    name = release_name("Star Wars: Episode V - The Empire Strikes Back", 1980, codec, [ma])
+    assert name.endswith(".DTS-HD.MA6.1-WiKi")
+    assert ".DTS.MA" not in name
+    assert track_name(ma) == "English DTS-HD MA 6.1"

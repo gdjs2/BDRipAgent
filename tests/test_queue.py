@@ -164,7 +164,7 @@ def test_removing_queued_job_cancels_task_and_ignores_stale_delivery(
     calls = []
     monkeypatch.setitem(HANDLERS, "analyze", lambda ctx: calls.append(ctx.task_id))
     assert client.delete(f"/api/jobs/{job_id}?confirm=no").status_code == 409
-    assert client.delete(f"/api/jobs/{job_id}?confirm={job_id}").json()["files_retained"]
+    assert not client.delete(f"/api/jobs/{job_id}?confirm={job_id}").json()["files_retained"]
     execute(task_id)
     assert not calls
     assert client.get("/api/jobs").json() == []

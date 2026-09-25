@@ -114,16 +114,18 @@ The application cannot determine that a directly copied `.mkv` is complete.
 7. The screenshot subsystem seeks through short windows across the movie, aiming
    for 100 usable candidates. It detects local histogram scene changes,
    rejects poor technical candidates, deduplicates them and creates contact sheets.
-   Codex retains up to 40 source frames and ranks the requested number of best
-   review choices (20 by default, adjustable from 2–40). The representative/challenge
-   ratio follows your policy, with at least two-thirds featuring characters.
-   The job pauses for review.
+   **Local filtering** is the default: no agent is called. The Best list starts
+   empty. Browse the filtered pool in **Shortlist** and use **Add to best** to
+   collect frames yourself. **Agent review** is optional and defaults to
+   30 best choices (adjustable from 2–40), with semantic character/diversity checks.
+   If the agent finds too few suitable frames, it samples new timeline windows.
+   The job pauses for your final choices.
    Frames must be at least 30 seconds apart, including across x264/x265 jobs for the
    same source path, size and modification time. Conflicting manual replacements
    are rejected; insufficient candidates fail explicitly for review.
 8. In **Screenshots**, open **Best** to inspect source/encode comparisons and
    choose any **1–15 pairs**. **Shortlist** shows all retained source frames (up to
-   40), with full-resolution previews. Use **Remove from best** and **Add to best**
+   100 in local mode, or 40 after agent review), with full-resolution previews. Use **Remove from best** and **Add to best**
    to edit the saved best list (up to 40). Added frames get comparison pairs when
    rendered. Click **Confirm N & render** to export your
    chosen set. Completed older jobs offer **Prepare best N** to review their saved
@@ -319,8 +321,11 @@ starts HandBrake; CRF sampling and other stages continue to use queue controls.
 Database migration `0004` adds the requested/acknowledged pause state.
 
 Use **Remove** beside a job on the dashboard to hide it from the list and cancel
-its queued work. The confirmation identifies the movie/profile. Files are retained;
-this action does not clean up storage.
+its queued work. Generated videos, releases, extracted tracks, screenshots, agent
+files and logs are deleted by the general worker (normally within 10 seconds).
+The source video is preserved. Shared uploads and analysis caches remain while
+another job uses that source, and are removed with its last job. Failed cleanup
+is retried automatically, including after restarts; the queue may be paused.
 
 ## Persistence and recovery
 
@@ -492,8 +497,10 @@ Different analysis settings or a changed source require a separate review.
 Confirmed audio/subtitle selections, their order, final track names, and flags are
 shared across all encodes of that unchanged source. Save in any editable Tracks tab
 to update the other encodes; new jobs adopt those choices after their review finishes.
-Each encode freezes its choices when preparation for remux starts. Already prepared
-or completed outputs retain their saved choices. Open tabs refresh untouched choices;
+Finished siblings automatically queue a remux using their retained encoded video.
+Busy siblings display the latest choices immediately and apply them after their running
+task finishes; queued downstream work is replaced with track preparation. No encoding
+is repeated. Open tabs refresh untouched choices;
 if another encode saves while you are editing, load the shared choices before saving.
 Migration `0007` stores the source-wide choices. Existing confirmations are adopted
 from the most recently saved selection for that source on reconciliation.
@@ -537,8 +544,8 @@ The original source remains required for chapters and container tags.
 Language codes are checked against the installed language registry and normalized
 (e.g. `jpn` → `ja`, `fre` → `fr`). The corresponding language name is shown next
 to the code. Manual corrections preserve the original analysis evidence and are
-shared with other editable encodes of the same source. A finished sibling needs
-its own explicit remux request.
+shared with all encodes of the same source. Finished siblings remux automatically;
+running work finishes safely before its track snapshot is updated.
 
 Remux uses a separate version directory and never reruns the encoder. Existing
 screenshot choices are retained and rendered again so filename overlays match the
@@ -546,11 +553,16 @@ new video. On **Release**, choose **Generate files** to regenerate BBCode, torre
 MD5 and NFO from that mux. Every generation gets a separate timestamped ART bundle;
 a failed replacement leaves the previous files available.
 
-Replaced outputs appear under **Artifacts → Backups** with their expiry date.
-`OUTPUT_BACKUP_DAYS=3` keeps them for three days after successful replacement;
-`0` disables automatic expiry. The general worker checks hourly and defers cleanup
-while the job has active tasks. Encoded video, source tracks, timestamps, and current
-outputs never expire through this cleanup. Modified backup files are retained.
+A successful re-encode deletes the previous encoded video; a successful remux
+deletes the previous mux and its exported video copies. Failed or cancelled
+replacements keep the previous videos. Cleanup runs after completion with a
+10-second recovery check. The current encoded video and source tracks remain
+available for further remuxes until the job is removed.
+
+Other replaced release files appear under **Artifacts → Backups**.
+`OUTPUT_BACKUP_DAYS=3` retains these metadata files for three days (`0` disables
+expiry); it does not retain superseded videos. Metadata cleanup checks hourly
+and waits for active work. Current outputs and modified backup files are protected.
 
 
 During an upgrade from the original combined worker, `start.sh` starts a temporary
@@ -633,9 +645,24 @@ muxing when the video is ready for **Edit tracks & remux**. Review and select th
 new tracks before remuxing; the existing video stays unchanged during the search.
 Automatic mode makes one attempt per job and reuses completed source-wide results. Configure
 `integrations.subtitle_discovery.max_candidates` (default 9, maximum 12) and
-`max_seconds` (default 1800, maximum 7200) in `config/application.yaml`. Pages
-requiring login, unsupported archives, and subtitles that cannot be aligned
-reliably remain linked in the report for manual review or upload. Manually
+`max_seconds` (default 1800 / 30 minutes) in `config/application.yaml` for
+subtitle discovery. Uploaded subtitle reviews use the independent
+`integrations.subtitle_review.max_seconds` limit (default 7200 / 2 hours).
+Each budget includes queue waits, cleanup/repair batches, alignment, PGS conversion
+and cropping; both are configurable from 60 seconds to 86400 (24 hours).
+Changes apply to the next attempt without restarting services. The per-agent-call
+execution timeout remains separate.
+
+Subtitle retries reuse completed cleanup batches, repair passes and alignment
+responses. Each checkpoint is written atomically and matched against the exact
+cues, source references, previous terminology choices and review policy; changed
+inputs are reviewed again. An interrupted agent request restarts, while completed
+requests are skipped. Retrying an older failed task also recovers validated
+responses from its saved conversation where the evidence still matches. Local PGS
+conversion can run again using the saved review.
+
+Pages requiring login, unsupported archives, and subtitles that cannot be aligned
+reliably remain linked in the report for manual review or upload. Manual
 PGS uploads retain their existing timing; text uploads and agent-discovered
 subtitles both receive automatic alignment.
 
@@ -646,17 +673,38 @@ shared track choices; replacing the source file starts a separate record. Existi
 release files remain available, with a notice when they use older information.
 
 
-The number of **Best screenshot candidates** is adjustable from 2–40 when creating
-a job and on its Screenshots tab. New jobs default to 20; older jobs retain the
-previous default of 15 until changed. This controls the agent’s recommendations
-per encode, independently of the final screenshot count. For example, request 20
-and choose 7 for x264 and 7 for x265. Saving the count applies to the next review;
-**Refresh best N** also saves the displayed count and reuses the existing shortlist
-(up to 40 frames), retaining current final images until you confirm replacements.
-If fewer eligible frames remain, the agent returns fewer choices. You can curate
-up to 40 best choices manually and select 1–15 final pairs; cross-codec spacing and
-B-frame checks still apply. A running review must finish or be cancelled before
-its count can be changed.
+Choose **Screenshot selection strategy** during task creation or in the Screenshots
+tab. **Local filtering** is the default: sample 200 timeline regions, reject frames
+with poor brightness, contrast or sharpness, remove visual duplicates, and verify
+matching source/encode B-frames. Best starts empty: all additions must be made
+manually from the filtered Shortlist using **Add to best**. Local checks do not identify spoilers or
+reliably reject credits; make those decisions in the gallery.
+
+**Agent review** also defaults to 30 best candidates; the count is adjustable from
+2–40. For example, review 30–40 and choose 7 for x264 and 7 for x265. If too few
+suitable frames are found, fresh windows are sampled without repeating prior
+frame preparation or reviewing already assessed candidates. The settings in
+`agent.screenshots` in `config/application.yaml` control the per-response timeout
+(default 1800 seconds), overall selection budget (7200 seconds), and sampling rounds
+(4 total). After the last round, a smaller valid set is reported with a warning;
+invalid agent decisions never bypass quality/diversity checks. Prepared candidates
+are checkpointed for retries.
+
+In agent mode, **Refresh best N** reuses the prepared pool. **Find 15 more screenshots**
+samples different timeline positions and appends up to 15 quality-checked frames to
+Shortlist. It preserves the existing shortlist, Best list and final selections;
+new frames must be added to Best manually. The scan excludes duplicate frames and
+the shared source pool is reused across all jobs for the same immutable source.
+Each encode checks the shared frames against its own video; unavailable B-frame pairs
+are omitted. Shortlists are sorted by source frame number. A separate **New batch** panel shows
+only the latest additions with the same manual **Add to best** controls. New batches automatically
+refresh sibling galleries, including finished jobs, without changing Best/final choices
+or existing releases. Jobs still encoding import the pool when ready. Final selection
+still rejects frames reserved by the other codec. If fewer than 15 pass filtering, the page reports
+how many were added; request another batch as needed. After cancelling a running screenshot review,
+you can switch strategy and retry with local filtering. Selected final images stay
+on disk until replacements are generated. Cross-codec spacing and B-frame checks
+apply to both strategies.
 
 
 After a full encode finishes, **Encode Status → Re-encode video** lets you choose
@@ -666,8 +714,8 @@ must finish or be cancelled and stopped first; queued downstream pipeline tasks
 are superseded atomically. The new encode uses a separate task output, preserving
 the previous video and release files until replacements succeed. Validation,
 B-frame candidate review, screenshot selection and release generation run again
-for the new video. Existing final/release output backup retention still applies
-(default three days after replacement). Sibling encodes are not restarted.
+for the new video. Replaced videos are removed after their replacements succeed;
+other release metadata follows `OUTPUT_BACKUP_DAYS`. Sibling encodes are not restarted.
 
 In **Tracks → Find missing subtitles → Agent-found subtitle tracks**, use
 **Remove subtitle track** to remove an unwanted discovery from the shared source
@@ -696,6 +744,7 @@ position, stay cancellable, and retain prepared inputs. The queue lives in the
 agent service; persistent pipeline tasks remain retryable after a service restart.
 `agent.busy_timeout_seconds` in `config/application.yaml` bounds the queue wait
 (default 1800 seconds), separately from the model execution timeout. Screenshot
+reviews instead use their own `agent.screenshots.max_seconds` budget (7200 by default). Screenshot
 connection failures retain a separate four-attempt recovery limit.
 
 
@@ -713,3 +762,51 @@ to text-cleanup batches; other agent operations keep the general model setting.
 Agent Live records the selected model and effort. Cleanup and repair progress
 retain their language and batch number while waiting in the agent queue and
 when the request begins running.
+
+
+### Container file ownership
+
+`./start.sh` records your host UID/GID as `APP_UID` and `APP_GID` in `.env`.
+API, media workers, encoder, CRF, agent and frontend run as that account. Generated
+files therefore belong to your user and primary group. Set these IDs explicitly
+when starting from a different account; do not use UID/GID 0.
+
+Startup runs a one-shot `permissions` service to migrate existing generated
+storage and Codex credentials. It does not mount or change incoming source files,
+follow symlinks, or loosen credential modes. PostgreSQL and Redis run as their own
+non-root service accounts in private named volumes; movie files never use them.
+The ownership helper is the only short-lived root process, scoped to these mounts.
+For direct Compose startup, run `docker compose --profile maintenance run --rm
+--no-deps permissions` after building, before starting the application services.
+
+Existing encoders are preserved during normal startup. Their runtime identity
+changes on the next safe encoder update (`./start.sh --update-encoder` with the
+queue paused and active encodes finished). Rerun startup then to migrate any
+remaining files written by the previous root encoder.
+
+
+Original-language flags are derived from the movie’s language codes (confirmed source-wide choices, explicit original-language settings, subtitle-discovery metadata, or IMDb languages), never from inherited track flags. Confirm or correct these codes in Track Selection; the setting is shared across encodes of the same source. Video always receives the Matroska Original flag, and audio/subtitles receive it when their language matches, ignoring script/region differences. Changing choices for a finished job uses the existing remux workflow. Existing files acquire the flags when remuxed.
+
+After a successful encode, Encode Status shows the retained video-only file size, the original source file size (including audio/subtitles), and the percentage of the source size. Smoke tests do not show a compression ratio.
+
+
+**Agent prompts** in the sidebar, beside **Agent Live**, edits the shared instructions for subtitle cleanup/repair, alignment, discovery, language/SDH classification, audio comparison/track flags, and screenshot selection. Saved prompts persist in the database across restarts and job deletion. The editor keeps separate drafts, checks for concurrent edits, supports Ctrl/⌘+S, and lets you restore and inspect built-in defaults. Agent Live links each new conversation to its prompt and records the revision actually used.
+
+Each new task attempt freezes its prompt versions. Save changes before starting or retrying a task; an in-progress subtitle file keeps consistent instructions across batches. Changed prompts invalidate incompatible cached agent findings and subtitle checkpoints while retaining local samples, OCR, and extracted frames. Saving does not automatically rerun completed work. Movie evidence and required output schemas are still supplied automatically; the editor changes the task instructions without requiring template variables. Local screenshot mode does not call an agent.
+
+
+Subtitle cleanup defaults to repairing the user's requested language, including mixed
+Chinese scripts, damaged text and recoverable translation errors. Ordinary quality
+notes do not block PGS generation. The agent reserves `BLOCKING:` issues for genuine
+unresolved problems such as a major-language mismatch or a large unrecoverable gap.
+Timing still passes independent dialogue-anchor checks; small differences within the
+supported tolerance are acceptable.
+
+In **Tracks → Uploaded subtitle reviews**, expand **Add guidance & continue review**
+to append instructions to a failed review. The same control is available for unresolved
+subtitle discovery reports. Guidance and the previous agent response are retained
+across retries and appear in Agent Live's prompt. Completed batches are reused by
+default, including when continuing a review created under older default prompts.
+Choose **Re-review all cues with this guidance** to apply new instructions to completed
+work too. Saved custom global prompts remain unchanged; restore the default in
+**Agent prompts** to adopt the updated instructions for customized tasks.

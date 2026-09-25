@@ -303,7 +303,10 @@ def test_agent_decision_cannot_claim_confidence_in_mixed_or_unknown_script():
 
 
 def test_legacy_prepared_subtitles_are_classified_before_mux(context, monkeypatch):
+    from backend.app import track_choices
     from worker.pipeline import stages
+
+    monkeypatch.setattr(track_choices, "original_languages", lambda db, job: [])
 
     ctx, track, _, _, _ = context
     ctx.job.analysis = {"prepared_tracks": [{**track, "path": "old.sup"}]}

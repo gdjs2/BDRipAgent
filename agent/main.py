@@ -13,7 +13,7 @@ from agent.screenshot_agent import CodexScreenshotSelector
 from agent.subtitle_agent import CodexSubtitleClassifier
 from agent.subtitle_discovery import CodexSubtitleDiscovery
 from agent.track_agent import CodexTrackReviewer
-from shared.config import behavior, get_settings
+from shared.config import behavior, get_settings, screenshot_selection_limits
 from shared.paths import contained, job_dir
 
 app = FastAPI(title="Screenshot and track review service")
@@ -41,7 +41,7 @@ def select(request: Request, authorization: str = Header(default=""), accept: st
     if "application/x-ndjson" in accept:
         return selection_stream(root)
     try:
-        with agent_queue.slot(agent_queue.enqueue(), timeout=queue_timeout()):
+        with agent_queue.slot(agent_queue.enqueue(), timeout=screenshot_selection_limits()["max_seconds"]):
             return CodexScreenshotSelector().select(root)
     except (RuntimeError, ValueError, TimeoutError) as error:
         raise HTTPException(502, str(error)) from error
@@ -128,7 +128,14 @@ def selection_stream(root, subtitle=False, tracks=False, discovery=False):
 
     def work(ticket):
         try:
-            with agent_queue.slot(ticket, timeout=queue_timeout(), check=check, on_position=position_changed):
+            with agent_queue.slot(
+                ticket,
+                timeout=queue_timeout()
+                if subtitle or tracks or discovery
+                else screenshot_selection_limits()["max_seconds"],
+                check=check,
+                on_position=position_changed,
+            ):
                 result = (
                     CodexSubtitleDiscovery(on_event=emit, check=check).run(root)
                     if discovery

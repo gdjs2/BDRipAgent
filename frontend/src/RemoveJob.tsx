@@ -54,8 +54,10 @@ export function RemoveJob({ job }: { job: Job }) {
           {job.analysis_profile} · {job.year}
         </p>
         <p>
-          This removes the job from the list and cancels its queued work. Source
-          files and generated files are retained.
+          This removes the job and deletes its generated videos, release files,
+          tracks, screenshots and logs. The source video is kept. Shared files
+          remain until the last job using that source is removed. Cleanup runs
+          in the background.
         </p>
         {running && (
           <p>

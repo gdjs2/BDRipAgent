@@ -16,7 +16,7 @@ const {chromium} = require('playwright');
     }
     const flags = {default: false, forced: false, hearing_impaired: false, visual_impaired: false, commentary: false};
     const makeTrack = (id, kind, name, language, description, extra={}) => ({track_id: id, kind, info: {source_order:id, name, base_name: name, mux_name: name, language, codec: kind === 'audio' ? 'DTS-HD MA' : 'PGS', codec_id: kind === 'audio' ? 'A_DTS' : 'S_HDMV/PGS', extractable: true, ...flags, track_review: {schema_version: 1, description, confidence: 'high', flag_explanation: 'Findings are based on sampled content. Review the flags before confirming.'}, ...(kind === 'subtitles' ? {subtitle_detection: {schema_version: 1, language_confident: true, status: 'resolved', hearing_impaired: false, explanation: description, sampled_cues: 96, unique_cues: 1280, method: 'program + agent'}} : {}), ...extra}});
-    let job = {id: 'fixture', title: 'The Night Train', source_path: 'The.Night.Train.2026.BluRay.mkv', state: 'ENCODING', tracks_editable: true, track_analysis_complete: true, analysis_profile: 'x265-live', analysis: {track_review_version: 1}, validation: {}, tasks: [], artifacts: [], screenshot_policy: {}, tracks: [
+    let job = {id: 'fixture', original_languages:[{code:'en',name:'English'}], title: 'The Night Train', source_path: 'The.Night.Train.2026.BluRay.mkv', state: 'ENCODING', tracks_editable: true, track_analysis_complete: true, analysis_profile: 'x265-live', analysis: {track_review_version: 1}, validation: {}, tasks: [], artifacts: [], screenshot_policy: {}, tracks: [
       makeTrack(1, 'audio', 'English DTS-MA 5.1', 'en', 'English main soundtrack. Sampled dialogue matches the film; no commentary or audio description was identified.', {default: true, channels: 6, sample_rate: 48000}),
       makeTrack(2, 'audio', 'French DTS-MA 5.1', 'fr', 'French dialogue in the sampled passages. Likely an alternate-language soundtrack; the sample cannot establish every scene.'),
       makeTrack(3, 'subtitles', 'English PGS', 'en', 'English dialogue with sound effects and speaker labels. Accessibility features support an SDH flag.', {hearing_impaired: true}),
@@ -56,6 +56,7 @@ const {chromium} = require('playwright');
         body = job;
       }
       else if (path.endsWith('/release')) {releaseDraft = route.request().postDataJSON(); body = {...job, analysis: {...job.analysis, release_details: releaseDraft}};}
+      else if (path.endsWith('/encoder-info')) body={filename:'video.encoder.txt',text:'x265 [info]: frame I: 20',sizes:{encoded_bytes:2147483648,source_bytes:8589934592,percent_of_source:25,encoding_skipped:false}};
       else if (path === '/api/jobs/fixture') body = job;
       else body = [];
       return route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(body)});
@@ -63,6 +64,13 @@ const {chromium} = require('playwright');
     await page.goto('http://127.0.0.1:4175/jobs/fixture/tracks');
     await page.getByRole('heading', {name: 'Choose your tracks'}).waitFor();
     assert.equal(await page.locator('.track-row').count(), 5);
+    assert.equal(await page.locator('[data-track-id="1"] .original-language').count(),1);
+    assert.equal(await page.locator('[data-track-id="2"] .original-language').count(),0);
+    assert.equal(await page.locator('[data-track-id="3"] .original-language').count(),1);
+    await page.getByLabel('Movie’s original language codes').fill('fr');
+    assert.equal(await page.locator('[data-track-id="1"] .original-language').count(),0);
+    assert.equal(await page.locator('[data-track-id="2"] .original-language').count(),1);
+    await page.getByLabel('Movie’s original language codes').fill('en');
     assert.deepEqual(await page.locator('.track-list[data-track-kind="audio"] .track-row').evaluateAll(rows=>rows.map(row=>Number(row.dataset.trackId))), [1,2]);
     assert.deepEqual(await page.locator('.track-list[data-track-kind="subtitles"] .track-row').evaluateAll(rows=>rows.map(row=>Number(row.dataset.trackId))), [3,4,5]);
     await page.getByRole('heading', {name: 'Audio differences'}).waitFor();
@@ -79,6 +87,7 @@ const {chromium} = require('playwright');
     await page.locator('#track-name-4').fill('French — Custom name');
     await page.getByRole('button', {name: 'Confirm tracks →'}).click();
     await page.waitForFunction(() => !document.querySelector('.track-confirm button').disabled);
+    assert.deepEqual(selection.original_languages,['en']);
     assert.deepEqual(selection.audio_track_ids, [1]);
     assert.deepEqual(selection.subtitle_track_ids, [4]);
     assert.equal(selection.track_flags['4'].hearing_impaired, false);
@@ -270,6 +279,16 @@ const {chromium} = require('playwright');
     await page.reload();
     await page.waitForFunction(() => document.body.textContent.includes('Track analysis is paused or stopped'));
     assert.equal(analyses, 1, 'An unreviewed waiting job should start automatically once');
+    job={...job,state:'WAITING_FOR_RELEASE_DETAILS',tasks:[{id:'encode1',type:'encode',status:'SUCCEEDED',stage:'ENCODING',attempt:1,progress:100,progress_detail:{},created_at:'2026-09-24T00:00:00Z'}]};
+    await page.goto('http://127.0.0.1:4175/jobs/fixture/encode');
+    await page.getByLabel('Encoding file sizes').waitFor();
+    await page.getByText('2.00 GiB',{exact:true}).waitFor();
+    await page.getByText('8.00 GiB',{exact:true}).waitFor();
+    await page.getByText('25.0% of original',{exact:true}).waitFor();
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.locator('.encode-sizes').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+    await page.screenshot({path:output+'/encode-sizes-mobile.png',fullPage:true});
+    assert.deepEqual(errors,[]);
     console.log('Browser checks passed: mouse/touch/keyboard reordering, saved order, group boundaries, locking, compact rows, comparative audio, editing during encoding, early release drafts, flags, mobile layout and automatic analysis.');
   } finally {
     await browser.close();

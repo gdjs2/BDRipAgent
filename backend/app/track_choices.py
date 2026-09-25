@@ -10,7 +10,8 @@ from sqlalchemy import func, select
 from shared.languages import language_tag
 from shared.models import Event, MovieJob, MovieTrack, SourceTrackChoices, Task, TrackSelection, now
 from shared.naming import automatic_track_name, track_name
-from shared.state import TRACK_EDIT_STAGES
+from shared.original_languages import movie_languages
+from shared.state import POST_TRACK_STAGES, TRACK_EDIT_STAGES
 from shared.tracks import FLAG_NAMES, track_analysis_complete
 
 
@@ -38,6 +39,11 @@ def track_rows(db, job):
             track_id=uploaded["track_id"], kind="subtitles", info=info
         )
     return tracks
+
+
+def original_languages(db, job):
+    record = db.get(SourceTrackChoices, source_key(job))
+    return movie_languages(job.analysis, record.data if record else None, job.imdb_metadata)
 
 
 def inventory(tracks):
@@ -139,6 +145,9 @@ def store_choices(db, job, body):
         body.track_languages,
     )
     data = choices_data(job, tracks, body.audio_track_ids, body.subtitle_track_ids, updated)
+    data["original_languages"] = (
+        body.original_languages if body.original_languages is not None else original_languages(db, job)
+    )
     data["confirmed_discovery_version"] = record.data.get("discovery_version", 0) if record else 0
     if record is None:
         record = SourceTrackChoices(source_key=source_key(job), revision=0, data={})
@@ -164,6 +173,7 @@ def write_snapshot(db, job, record, tracks, updated):
         "uploaded_tracks": [
             deepcopy(t.info) for t in tracks.values() if t.info.get("origin") in ("upload", "discovery")
         ],
+        "original_languages": movie_languages(job.analysis, record.data, job.imdb_metadata),
         "shared_track_selection": {
             "revision": record.revision,
             "source_job_id": record.data["source_job_id"],
@@ -187,9 +197,9 @@ def write_snapshot(db, job, record, tracks, updated):
     )
 
 
-def apply_shared_choices(db, job, record=None):
+def apply_shared_choices(db, job, record=None, *, preparing_remux=False):
     """Apply only after review is finished and before preparing the final tracks."""
-    if job.state not in TRACK_EDIT_STAGES:
+    if job.state not in TRACK_EDIT_STAGES and not preparing_remux:
         return False
     record = record or db.get(SourceTrackChoices, source_key(job))
     if (
@@ -290,6 +300,36 @@ def shared_choices_status(db, job):
         "applied_revision": applied,
         "source_job_id": record.data["source_job_id"],
         "updated_at": record.updated_at,
-        "pending": job.state in TRACK_EDIT_STAGES and applied != record.revision,
+        "pending": applied != record.revision,
+        "remux_pending": job.state in POST_TRACK_STAGES and applied != record.revision,
         "error": job.analysis.get("shared_track_selection_error"),
     }
+
+
+def shared_choices_view(db, job):
+    """Display desired source choices without modifying a running task's snapshot."""
+    record = db.get(SourceTrackChoices, source_key(job))
+    if (
+        not record
+        or "audio_track_ids" not in record.data
+        or job.analysis.get("shared_track_selection", {}).get("revision") == record.revision
+    ):
+        return None
+    if not db.scalar(select(TrackSelection.id).where(TrackSelection.job_id == job.id)):
+        return None
+    tracks = track_rows(db, job)
+    data = record.data
+    if inventory(tracks) != [tuple(t) for t in data["inventory"]]:
+        return None
+    try:
+        updated = checked_tracks(
+            tracks,
+            data["audio_track_ids"],
+            data["subtitle_track_ids"],
+            {int(k): v for k, v in data["track_names"].items()},
+            {int(k): v for k, v in data["track_flags"].items()},
+            {int(k): v for k, v in data.get("track_languages", {}).items()},
+        )
+    except ValueError:
+        return None
+    return data, updated

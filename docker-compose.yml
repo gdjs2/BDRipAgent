@@ -11,22 +11,32 @@ x-app-env: &app-env
   WORKER_CAPACITY: ${WORKER_CAPACITY:-8}
   OUTPUT_BACKUP_DAYS: ${OUTPUT_BACKUP_DAYS:-3}
 
+x-app-build-args: &app-build-args
+  APP_UID: ${APP_UID:-1000}
+  APP_GID: ${APP_GID:-1000}
+
+x-app-user: &app-user "${APP_UID:-1000}:${APP_GID:-1000}"
+
 services:
   frontend:
+    user: *app-user
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args: *app-build-args
     ports:
-      - '${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:80'
+      - '${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080'
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
 
   api:
+    user: *app-user
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args: *app-build-args
     environment:
       <<: *app-env
       CPU_STAT_PATH: /host/proc/stat
@@ -58,9 +68,11 @@ services:
     restart: unless-stopped
 
   worker: &media-worker
+    user: *app-user
     build:
       context: .
       dockerfile: worker/Dockerfile
+      args: *app-build-args
     init: true
     command: [python, -m, celery, -A, 'worker.tasks:celery', worker, '--loglevel=INFO', '--queues=bdrip.other', '--hostname=general@%h', '--autoscale=${WORKER_CAPACITY:-8},1']
     environment:
@@ -117,10 +129,12 @@ services:
         condition: service_healthy
 
   agent:
+    user: *app-user
     build:
       context: .
       dockerfile: agent/Dockerfile
       args:
+        <<: *app-build-args
         CODEX_VERSION: ${CODEX_VERSION:-0.155.1}
     init: true
     environment:
@@ -145,7 +159,31 @@ services:
       retries: 10
     restart: unless-stopped
 
+  permissions:
+    profiles: [maintenance]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args: *app-build-args
+    user: "0:0"
+    entrypoint: [python, /app/scripts/storage_permissions.py]
+    environment:
+      APP_UID: ${APP_UID:-1000}
+      APP_GID: ${APP_GID:-1000}
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ${STORAGE_ROOT:-./data}/jobs:/workspace
+      - ${STORAGE_ROOT:-./data}/completed:/completed
+      - ${STORAGE_ROOT:-./data}/artifacts:/artifacts
+      - ${STORAGE_ROOT:-./data}/cache:/cache
+      - codex-auth:/auth
+
   postgres:
+    user: postgres
     image: postgres:17-bookworm
     environment:
       POSTGRES_DB: movie
@@ -160,6 +198,7 @@ services:
     restart: unless-stopped
 
   redis:
+    user: redis
     image: redis:7.4-alpine
     command: [redis-server, --appendonly, 'yes']
     volumes: [redis-data:/data]

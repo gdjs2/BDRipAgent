@@ -222,9 +222,84 @@ def test_followup_preserves_initial_edits_and_reports_damaged_characters():
                 }
             ]
         )
-        return answer(edits=edits, issues=["CRITICAL cue 3 damaged"])
+        return answer(usable=False, edits=edits, issues=["CRITICAL cue 3 damaged"])
 
     cleaned, report = clean_subtitles(ctx, text, candidate, request)
     assert cleaned[1].plaintext == "Hello, Anna."
     assert "\ufffd" in cleaned[2].plaintext
     assert any("damaged replacement characters" in error for error in report["critical_errors"])
+
+
+@pytest.mark.parametrize("remove_ids,valid", [([2], True), ([1, 2], False)])
+def test_duplicate_removal_requires_one_exact_copy_to_remain(remove_ids, valid):
+    ctx, text, candidate = fixture()
+    text.events = [
+        pysubs2.SSAEvent(start=1000, end=2000, text="Hello"),
+        pysubs2.SSAEvent(start=1000, end=2000, text="Hello"),
+        pysubs2.SSAEvent(start=3000, end=4000, text="Goodbye"),
+    ]
+    edits = [
+        dict(
+            cue_id=i,
+            original_text="Hello",
+            replacement_text=None,
+            action="remove_duplicate",
+            reason="Exact duplicate",
+        )
+        for i in remove_ids
+    ]
+    if not valid:
+        with pytest.raises(ValueError, match="will be retained"):
+            clean_subtitles(ctx, text, candidate, lambda *a: answer(edits=edits))
+    else:
+        cleaned, report = clean_subtitles(ctx, text, candidate, lambda *a: answer(edits=edits))
+        assert [(c.plaintext, c.start, c.end) for c in cleaned] == [
+            ("Hello", 1000, 2000),
+            ("Goodbye", 3000, 4000),
+        ]
+        assert report["edited_cues"] == 1
+
+
+@pytest.mark.parametrize("second_text", ["Hello", "since you returned"])
+def test_adjacent_dialogue_cannot_be_deleted_as_duplicate(second_text):
+    ctx, text, candidate = fixture()
+    text.events = [
+        pysubs2.SSAEvent(start=1000, end=2000, text="Hello"),
+        pysubs2.SSAEvent(start=2000, end=3000, text=second_text),
+    ]
+    edit = dict(
+        cue_id=2,
+        original_text=second_text,
+        replacement_text=None,
+        action="remove_duplicate",
+        reason="Merge into previous cue",
+    )
+    with pytest.raises(ValueError, match="Adjacent or split dialogue is not a duplicate"):
+        clean_subtitles(ctx, text, candidate, lambda *a: answer(edits=[edit]))
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "剩余批次尚未提供，无法审查整部字幕；本批次已修复。",
+        "Later batches have not been supplied; this batch is complete.",
+        "One minor wording uncertainty remains after repair.",
+    ],
+)
+def test_usable_batch_notes_do_not_repeat_review(note):
+    ctx, subtitles, candidate = fixture()
+    subtitles.events = [
+        pysubs2.SSAEvent(start=i * 1000, end=i * 1000 + 800, text=f"Line {i}") for i in range(201)
+    ]
+    batches = []
+
+    def request(ctx, inventory):
+        batches.append(inventory["batch"])
+        assert "previous_review" not in inventory
+        return answer(issues=[note])
+
+    cleaned, report = clean_subtitles(ctx, subtitles, candidate, request)
+    assert batches == [1, 2, 3]
+    assert len(cleaned) == 201
+    assert all(review["issues"] == [note] for review in report["reviews"])
+    assert not report["critical_errors"]

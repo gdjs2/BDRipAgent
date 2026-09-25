@@ -22,6 +22,7 @@ def main():
                     "title_localized": movie.title_localized,
                     "title_akas": movie.title_akas,
                     "year": movie.year,
+                    "original_languages": movie.languages,
                 }
             )
         )

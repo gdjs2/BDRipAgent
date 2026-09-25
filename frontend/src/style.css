@@ -2438,3 +2438,221 @@ label.track:has(> input[type="checkbox"]) {
   max-height: none;
   overflow: visible;
 }
+
+.encode-sizes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 20px 0 12px;
+}
+.encode-sizes > div {
+  padding: 16px;
+  background: #111519;
+  border: 1px solid #293237;
+  border-radius: 8px;
+}
+.encode-sizes dt {
+  color: #9faeb8;
+  font-size: 12px;
+}
+.encode-sizes dd {
+  margin: 8px 0 0;
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+.track-chip.original-language {
+  color: #97d4bc;
+  background: #19352d;
+  border-color: #31574a;
+}
+.movie-languages {
+  margin: 20px 0;
+}
+.movie-languages input {
+  max-width: 480px;
+}
+
+/* Agent prompt workspace */
+.prompt-scope {
+  max-width: 960px;
+  color: #aebbc4;
+  line-height: 1.65;
+}
+.prompt-workspace {
+  display: grid;
+  grid-template-columns: 245px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+  margin-top: 26px;
+}
+.prompt-task-list {
+  display: grid;
+  gap: 8px;
+}
+.prompt-task-list button {
+  text-align: left;
+  display: grid;
+  justify-content: stretch;
+  justify-items: start;
+  gap: 7px;
+  padding: 16px;
+  background: #191e23;
+  border: 1px solid #303941;
+  border-radius: 8px;
+  color: #cbd5dc;
+  white-space: normal;
+}
+.prompt-task-list button.selected {
+  border-color: #c29f66;
+  background: #28261f;
+  color: #f2d7a8;
+  box-shadow: inset 3px 0 #c29f66;
+}
+.prompt-task-list small {
+  color: #97a6b2;
+  font-size: 11px;
+}
+.prompt-editor {
+  min-width: 0;
+  margin: 0;
+}
+.prompt-editor h2 {
+  margin-top: 0;
+}
+.prompt-editor .section-heading {
+  align-items: start;
+}
+.prompt-editor .section-heading p {
+  color: #9eafba;
+  line-height: 1.6;
+  max-width: 65ch;
+}
+.prompt-editor textarea {
+  width: 100%;
+  min-height: 420px;
+  height: 52vh;
+  max-height: 85vh;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.75;
+  padding: 20px;
+  background: #101519;
+  border: 1px solid #38424b;
+  border-radius: 8px;
+  tab-size: 2;
+}
+.prompt-editor textarea:focus {
+  border-color: #c29f66;
+  outline: 2px solid #c29f662b;
+  outline-offset: 2px;
+}
+.prompt-editor-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  color: #91a1af;
+  font-size: 11px;
+}
+.prompt-editor-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 22px 0;
+}
+.prompt-default {
+  margin: 24px 0;
+  border-top: 1px solid #303941;
+  padding-top: 16px;
+}
+.prompt-default summary {
+  cursor: pointer;
+  color: #b8c7d2;
+}
+.prompt-default pre {
+  max-height: 400px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.agent-live-role a {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: normal;
+}
+@media (max-width: 1000px) {
+  .prompt-workspace {
+    grid-template-columns: 1fr;
+  }
+  .prompt-task-list {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  }
+}
+@media (max-width: 600px) {
+  .prompt-task-list {
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .prompt-task-list button {
+    padding: 12px;
+    font-size: 12px;
+  }
+  .prompt-editor textarea {
+    padding: 12px;
+    min-height: 360px;
+  }
+  .prompt-editor .section-heading {
+    flex-wrap: wrap;
+  }
+}
+
+.subtitle-review-guidance {
+  margin-top: 14px;
+  min-width: 0;
+}
+.review-guidance-editor {
+  border: 1px solid #68444b;
+  border-radius: 8px;
+  padding: 14px;
+  background: #231d22;
+}
+.review-guidance-editor summary {
+  color: #f0b4b9;
+  font-weight: 600;
+  cursor: pointer;
+}
+.review-guidance-editor textarea {
+  display: block;
+  width: 100%;
+  margin: 8px 0 12px;
+  min-height: 110px;
+  resize: vertical;
+}
+.subtitle-review-guidance .review-guidance-recheck,
+.review-guidance-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-direction: row;
+  justify-content: flex-start;
+}
+.review-guidance-recheck input {
+  width: auto;
+}
+.review-guidance-actions {
+  margin-top: 14px;
+}
+.subtitle-review-guidance blockquote {
+  margin: 12px 0;
+  padding: 10px 14px;
+  border-left: 2px solid #b89c70;
+  background: #1c2228;
+}
+.subtitle-review-guidance blockquote p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

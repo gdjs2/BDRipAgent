@@ -1,11 +1,13 @@
 import json
 import math
+import time
 from pathlib import Path
 from uuid import uuid4
 
 from agent.codex_stream import invoke
 from agent.schemas import Selection, review_policy, validate_selection
-from shared.config import ScreenshotPolicy, behavior
+from shared.agent_prompts import prompt_events, request_prompt
+from shared.config import ScreenshotPolicy, behavior, screenshot_selection_limits
 from shared.paths import contained
 
 
@@ -26,7 +28,14 @@ class CodexScreenshotSelector:
 
         emit({"type": "prompt", "text": prompt, "images": [image.name for image in images]})
         try:
-            text, thread = invoke(prompt, images, Selection.model_json_schema(), emit, self.check)
+            text, thread = invoke(
+                prompt,
+                images,
+                Selection.model_json_schema(),
+                emit,
+                self.check,
+                timeout_seconds=screenshot_selection_limits()["request_timeout_seconds"],
+            )
             selection = Selection.model_validate_json(text)
             emit({"type": "complete", "text": "Response received"})
             return selection, thread
@@ -36,26 +45,51 @@ class CodexScreenshotSelector:
 
     def select(self, root: Path):
         inventory = json.loads(contained(root, "inventory.json", exists=True).read_text())
+        original_check = self.check
+        deadline = time.monotonic() + min(
+            screenshot_selection_limits()["max_seconds"],
+            inventory.get("remaining_seconds", screenshot_selection_limits()["max_seconds"]),
+        )
+
+        def check():
+            original_check()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Screenshot selection reached its configured time limit")
+
+        self.check = check
         candidates = inventory["candidates"]
         policy = ScreenshotPolicy.model_validate(inventory["policy"])
-        prompt = (Path(__file__).parent / "prompts/screenshot_selection.md").read_text()
+        selected_prompt = request_prompt(inventory, "screenshot_selection")
+        self.on_event = prompt_events(self.on_event, selected_prompt)
+        prompt = selected_prompt["text"]
         base = prompt + "\nPolicy:\n" + policy.model_dump_json() + "\nInventory:\n" + json.dumps(candidates)
         sheets = [contained(root, p, exists=True) for p in inventory["contact_sheets"]]
         runs = []
         shortlisted = Selection(selected=inventory.get("shortlisted_choices", [])).selected
+        reviewed = set(inventory.get("reviewed_candidate_ids", []))
         per_sheet = max(6, math.ceil(min(40, len(candidates)) / max(1, len(sheets))))
         # Bound image count and context size: two contact sheets per shortlist call.
         for index in range(0, 0 if inventory.get("shortlisted_ids") else len(sheets), 2):
             group = sheets[index : index + 2]
-            visible = [c for c in candidates if c["sheet"] in inventory["contact_sheets"][index : index + 2]]
+            visible = [
+                c
+                for c in candidates
+                if c["sheet"] in inventory["contact_sheets"][index : index + 2]
+                and c["candidate_id"] not in reviewed
+            ]
+            if not visible:
+                continue
             decision, thread = self._invoke(
                 base + f"\nShortlist up to {per_sheet} strong frames from EACH attached sheet. "
-                "Do not fill the final set yet.",
+                "Do not fill the final set yet. Never pad the shortlist with poor frames. "
+                + "Only review these unreviewed IDs: "
+                + json.dumps([c["candidate_id"] for c in visible]),
                 group,
             )
             allowed = {c["candidate_id"] for c in visible}
             if any(c.candidate_id not in allowed for c in decision.selected):
                 raise ValueError("Codex returned IDs absent from the attached contact sheets")
+            reviewed.update(allowed)
             shortlisted.extend(decision.selected)
             runs.append({"stage": "shortlist", "thread_id": thread, "output": decision.model_dump()})
         deduplicated = {c.candidate_id: c for c in shortlisted}
@@ -70,8 +104,19 @@ class CodexScreenshotSelector:
         if len(short_ids) > 40:
             raise ValueError("Screenshot shortlist cannot exceed 40 frames")
         short = [c for c in candidates if c["candidate_id"] in short_ids]
-        if len(short) < policy.count:
-            raise ValueError("Codex shortlist contains fewer candidates than the requested final count")
+        if len(short) < policy.best_count and not inventory.get("allow_partial", True):
+            return {
+                "selected": [],
+                "shortlisted_choices": [c.model_dump() for c in ordered],
+                "shortlisted_ids": sorted(short_ids),
+                "reviewed_candidate_ids": sorted(reviewed),
+                "needs_more_candidates": True,
+                "runs": runs,
+            }
+        if len(short) < 2:
+            raise ValueError(
+                "Too few suitable frames after sampling; use local selection or increase the sampling limit"
+            )
         policy = review_policy(policy, len(short))
         images = [contained(root, c["agent_image"], exists=True) for c in short]
         final_prompt = (
@@ -103,11 +148,24 @@ class CodexScreenshotSelector:
             if not errors:
                 return {
                     "selected": decision.model_dump()["selected"],
+                    "needs_more_candidates": len(decision.selected)
+                    < inventory["policy"].get("best_count", 30),
+                    "reviewed_candidate_ids": sorted(reviewed),
                     "shortlisted_choices": [c.model_dump() for c in ordered if c.candidate_id in short_ids],
                     "shortlisted_ids": sorted(short_ids),
                     "runs": runs,
                     "thread_id": thread,
                 }
+        if not inventory.get("allow_partial", True):
+            return {
+                "selected": [],
+                "shortlisted_choices": [c.model_dump() for c in ordered],
+                "shortlisted_ids": sorted(short_ids),
+                "reviewed_candidate_ids": sorted(reviewed),
+                "needs_more_candidates": True,
+                "runs": runs,
+                "errors": errors,
+            }
         raise ValueError("Codex selection failed deterministic diversity checks: " + "; ".join(errors))
 
 

@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class Stage(StrEnum):
+    SYNCING_SCREENSHOTS = "SYNCING_SCREENSHOTS"
     NEW = "NEW"
     ANALYZING_SOURCE = "ANALYZING_SOURCE"
     RUNNING_CRF_ANALYSIS = "RUNNING_CRF_ANALYSIS"
@@ -26,7 +27,13 @@ class Stage(StrEnum):
 STAGES = [
     stage
     for stage in Stage
-    if stage not in (Stage.ANALYZING_TRACKS, Stage.FINDING_SUBTITLES, Stage.REVIEWING_SUBTITLE_UPLOAD)
+    if stage
+    not in (
+        Stage.SYNCING_SCREENSHOTS,
+        Stage.ANALYZING_TRACKS,
+        Stage.FINDING_SUBTITLES,
+        Stage.REVIEWING_SUBTITLE_UPLOAD,
+    )
 ]
 TRACK_EDIT_STAGES = {
     Stage.RUNNING_CRF_ANALYSIS,
@@ -35,6 +42,7 @@ TRACK_EDIT_STAGES = {
     Stage.VALIDATING_ENCODE,
     Stage.WAITING_FOR_TRACK_SELECTION,
 }
+POST_TRACK_STAGES = set(STAGES[STAGES.index(Stage.PREPARING_TRACKS) :])
 REMUX_STATES = {Stage.COMPLETE, Stage.WAITING_FOR_RELEASE_DETAILS, Stage.WAITING_FOR_SCREENSHOT_SELECTION}
 # Keep scheduler eligibility and worker lease admission in agreement.
 TRACK_TASK_STATES = {
@@ -42,7 +50,14 @@ TRACK_TASK_STATES = {
     Stage.FINDING_SUBTITLES: TRACK_EDIT_STAGES | REMUX_STATES,
     Stage.REVIEWING_SUBTITLE_UPLOAD: TRACK_EDIT_STAGES | REMUX_STATES,
 }
+SCREENSHOT_SYNC_STATES = {
+    Stage.WAITING_FOR_SCREENSHOT_SELECTION,
+    Stage.WAITING_FOR_RELEASE_DETAILS,
+    Stage.COMPLETE,
+}
+
 TASK_TYPES = {
+    Stage.SYNCING_SCREENSHOTS: "sync_screenshots",
     Stage.ANALYZING_SOURCE: "analyze",
     Stage.ANALYZING_TRACKS: "review_tracks",
     Stage.FINDING_SUBTITLES: "discover_subtitles",

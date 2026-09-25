@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[1]
 ScreenshotDecoder = Literal["cpu", "cuda"]
+ScreenshotStrategy = Literal["local", "agent"]
 
 
 class Settings(BaseSettings):
@@ -49,7 +50,8 @@ class Settings(BaseSettings):
 
 class ScreenshotPolicy(BaseModel):
     decoder: ScreenshotDecoder = "cuda"
-    best_count: int = Field(default=15, ge=2, le=40, strict=True)
+    strategy: ScreenshotStrategy = "local"
+    best_count: int = Field(default=30, ge=2, le=40, strict=True)
     count: int = Field(default=7, ge=2, le=30)
     representative: int = Field(default=4, ge=0)
     encode_challenging: int = Field(default=3, ge=0)
@@ -80,7 +82,23 @@ def behavior() -> dict:
     return yaml.safe_load(get_settings().config_path.read_text())
 
 
+def subtitle_processing_timeout_seconds(*, discovery: bool = False) -> int:
+    """Independent wall-clock budgets for discovery and uploaded subtitle repairs."""
+    key, default = ("subtitle_discovery", 1800) if discovery else ("subtitle_review", 7200)
+    limits = behavior()["integrations"].get(key, {})
+    return max(60, min(86400, int(limits.get("max_seconds", default))))
+
+
 def profiles() -> dict:
     return {
         p.stem: yaml.safe_load(p.read_text()) for p in sorted(get_settings().profiles_root.glob("*.yaml"))
+    }
+
+
+def screenshot_selection_limits():
+    options = behavior()["agent"].get("screenshots", {})
+    return {
+        "request_timeout_seconds": max(60, min(7200, int(options.get("request_timeout_seconds", 1800)))),
+        "max_seconds": max(60, min(86400, int(options.get("max_seconds", 7200)))),
+        "max_sampling_rounds": max(1, min(10, int(options.get("max_sampling_rounds", 4)))),
     }

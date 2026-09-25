@@ -14,11 +14,20 @@ from backend.app import queue
 from backend.app.services import event, get_job
 from backend.app.subtitle_uploads import register_upload, validate_subtitle
 from backend.app.track_choices import source_key, track_rows
-from shared.config import behavior
+from shared.agent_prompts import task_prompts
+from shared.config import behavior, subtitle_processing_timeout_seconds
 from shared.db import session
 from shared.models import SourceTrackChoices, Task, now
 from shared.paths import contained, job_dir, write_json
-from shared.subtitle_discovery import DiscoveryPolicy, SearchResult, SubtitleReview, covers, missing_languages
+from shared.subtitle_discovery import (
+    DiscoveryPolicy,
+    SearchResult,
+    SubtitleReview,
+    blocking_issues,
+    covers,
+    missing_languages,
+)
+from shared.subtitle_guidance import previous_review, task_guidance
 from shared.subtitles import SUBTITLE_ANALYSIS_VERSION
 from worker.adapters.handbrake import Crop
 from worker.adapters.integrations import Sup2supAdapter, pgs_dimensions
@@ -62,10 +71,19 @@ def source_references(ctx):
 
 
 def agent_request(ctx, inventory):
+    from worker.adapters import subtitle_resume
+
+    key = {"search": "subtitle_discovery", "clean": "subtitle_cleanup", "align": "subtitle_alignment"}[
+        inventory["mode"]
+    ]
+    inventory = {**inventory, "agent_prompt": task_prompts(ctx)[key]}
+    guidance = task_guidance(ctx)
+    resumable = inventory["mode"] in subtitle_resume.PROMPTS
+    if resumable:
+        subtitle_resume.recover_previous_attempts(ctx)
     root = contained(
         job_dir(job_dir(ctx.settings.cache_root / "agent", ctx.job.id), ctx.task_id), "discovery"
     )
-    write_json(root / "inventory.json", inventory)
     if inventory["mode"] == "clean":
         action = "Repairing" if inventory.get("previous_review") else "Cleaning"
         phase = (
@@ -76,8 +94,39 @@ def agent_request(ctx, inventory):
         phase = f"Aligning {inventory['candidate']['language']} subtitles against source dialogue"
     else:
         phase = "Searching for missing subtitles"
+    if guidance and not guidance[-1]["recheck_completed"]:
+        saved = subtitle_resume.load(ctx, inventory)
+        if saved is not None:
+            ctx.progress(None, phase=f"Resuming saved review · {phase}")
+            ctx.log(f"Reusing completed subtitle review: {phase}")
+            return saved
+    if guidance:
+        inventory["review_guidance"] = {
+            "messages": [item["message"] for item in guidance],
+            "previous_failure": guidance[-1]["previous_error"],
+            "previous_agent_review": previous_review(ctx),
+            "recheck_completed": guidance[-1]["recheck_completed"],
+        }
+    write_json(root / "inventory.json", inventory)
+    if resumable and (saved := subtitle_resume.load(ctx, inventory)) is not None:
+        ctx.progress(None, phase=f"Resuming saved review · {phase}")
+        ctx.log(f"Reusing completed subtitle review: {phase}")
+        return saved
     ctx.progress(None, phase=phase)
-    return review(ctx, discovery=True, phase=phase)
+    state_path = contained(ctx.workspace, f"subtitle-review-state/{ctx.task_id}.json")
+    write_json(state_path, {"inventory": inventory, "status": "running"})
+    answer = None
+    try:
+        answer = review(ctx, discovery=True, phase=phase)
+        if resumable:
+            answer = subtitle_resume.save(ctx, inventory, answer)
+        write_json(state_path, {"inventory": inventory, "answer": answer, "status": "complete"})
+        return answer
+    except (ValueError, RuntimeError, TimeoutError) as error:
+        write_json(
+            state_path, {"inventory": inventory, "answer": answer, "error": str(error), "status": "blocked"}
+        )
+        raise
 
 
 def checkpoint(ctx, report):
@@ -175,10 +224,12 @@ def process_file(ctx, candidate, path, filename, receipt, references, index, *, 
     alignment = fit_alignment(
         decision.model_copy(update={"usable": True}), quality["sampled_cues"], references, duration
     )
+    if blocking_issues(decision):
+        raise ValueError("Subtitle review needs guidance: " + "; ".join(blocking_issues(decision)))
     critical_errors = list(cleanup["critical_errors"])
-    critical_errors.extend(decision.issues)
-    if not decision.usable:
-        critical_errors.append(decision.explanation)
+    critical_errors.extend(
+        issue for issue in decision.issues if issue.lstrip().upper().startswith(("CRITICAL", "BLOCKING:"))
+    )
     critical_errors = list(dict.fromkeys(critical_errors))
     alignment["movie_fps"] = video["fps"]
     alignment["inferred_candidate_fps"] = float(Fraction(video["fps"])) * alignment["scale"]
@@ -265,13 +316,20 @@ def discover_subtitles(ctx):
     policy = DiscoveryPolicy.model_validate(ctx.job.analysis.get("subtitle_discovery_policy", {}))
     key = source_key(ctx.job)
     signature = {
+        "guidance": [item["id"] for item in task_guidance(ctx)],
+        "prompt_hashes": {
+            key: value["sha256"]
+            for key, value in task_prompts(ctx).items()
+            if key in {"subtitle_discovery", "subtitle_cleanup", "subtitle_alignment"}
+        },
         "discovery_policy_version": 3,  # English coverage, Chinese normalization, and evidence-ranked candidates.
         "title": ctx.job.title,
         "year": ctx.job.year,
         "original_languages": policy.original_languages,
     }
     limits = behavior()["integrations"].get("subtitle_discovery", {})
-    deadline = time.monotonic() + max(60, min(7200, int(limits.get("max_seconds", 1800))))
+    timeout = subtitle_processing_timeout_seconds(discovery=True)
+    deadline = time.monotonic() + timeout
     ctx = ctx.branch()
     original_check = ctx.check
 
@@ -279,7 +337,9 @@ def discover_subtitles(ctx):
         original_check()
         if time.monotonic() > deadline:
             raise TimeoutError(
-                "Subtitle discovery reached its time limit; review the partial report and retry if needed"
+                f"Subtitle discovery reached its {timeout / 3600:g}-hour time limit; "
+                "increase integrations.subtitle_discovery.max_seconds in config/application.yaml "
+                "and retry after reviewing the partial report"
             )
 
     ctx.check = check

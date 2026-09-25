@@ -172,17 +172,14 @@ def expire(job_id):
         db.commit()
 
 
-def test_backups_expire_only_after_three_days_and_never_touch_inputs(client, completed_job, environment):
+def test_replaced_videos_expire_immediately_and_never_touch_inputs(client, completed_job, environment):
     backup = retire(client, completed_job)
     from datetime import datetime
 
     assert datetime.fromisoformat(backup["expires_at"]) - datetime.fromisoformat(
         backup["replaced_at"]
-    ) == timedelta(days=3)
+    ) == timedelta(0)
     old = environment.completed_root / completed_job / "old-WiKi.mkv"
-    cleanup_expired_outputs()
-    assert old.exists()
-    expire(completed_job)
     cleanup_expired_outputs()
     assert not old.exists()
     assert (environment.workspace_root / completed_job / "encoded.mkv").read_bytes() == b"retained video"
@@ -190,7 +187,7 @@ def test_backups_expire_only_after_three_days_and_never_touch_inputs(client, com
     assert read(client, completed_job)["artifacts"] == []
 
 
-@pytest.mark.parametrize("changed", ["current", "modified", "symlink", "active"])
+@pytest.mark.parametrize("changed", ["current", "modified", "symlink"])
 def test_cleanup_preserves_current_changed_or_busy_outputs(client, completed_job, environment, changed):
     retire(client, completed_job)
     expire(completed_job)
@@ -410,7 +407,7 @@ def test_native_remux_and_release_regeneration(client, environment, monkeypatch,
     first_media = environment.artifacts_root / next(
         a["path"] for a in first["artifacts"] if a["kind"] == "RELEASE_MEDIA"
     )
-    first_bytes = first_media.read_bytes()
+    assert first_media.stat().st_size > 0
     uploads = []
     if external_subtitles:
         import runpy
@@ -439,7 +436,7 @@ def test_native_remux_and_release_regeneration(client, environment, monkeypatch,
     revised = execute_next("mux")
     assert revised["state"] == "SCREENSHOT_RENDERING"
     movie = environment.completed_root / revised["analysis"]["final_path"]
-    assert movie != old and old.exists()
+    assert movie != old and not old.exists()
     inspection = json.loads(run("mkvmerge", "-J", movie).stdout)
     assert inspection["container"]["properties"]["title"] == "Native Remux (2026)"
     assert movie.name == revised["release_name"] + ".mkv"
@@ -466,7 +463,7 @@ def test_native_remux_and_release_regeneration(client, environment, monkeypatch,
     assert final["state"] == "COMPLETE" and second["bundle_path"] != first["bundle_path"]
     assert second["md5"] == hashlib.md5(movie.read_bytes()).hexdigest()
     assert second["infohash"] != first["infohash"]
-    assert first_media.read_bytes() == first_bytes
+    assert not first_media.exists()
     assert hashlib.sha256(encoded.read_bytes()).hexdigest() == encoded_hash
     assert sum(t["type"] == "encode" for t in final["tasks"]) == 1
     assert any(a["info"].get("backup") for a in final["artifacts"] if a["artifact_type"] == "RELEASE_TORRENT")
@@ -494,7 +491,7 @@ def test_native_remux_and_release_regeneration(client, environment, monkeypatch,
     failed = read(client, job_id)
     assert next(t for t in failed["tasks"] if t["id"] == pending["id"])["status"] == "FAILED"
     assert failed["analysis"]["final_path"] == str(movie.relative_to(environment.completed_root))
-    assert movie.is_file() and first_media.is_file()
+    assert movie.is_file() and not first_media.exists()
     with session() as db:
         for row in db.scalars(select(Artifact).where(Artifact.job_id == job_id)):
             if row.info.get("backup"):
@@ -516,3 +513,132 @@ def test_native_remux_and_release_regeneration(client, environment, monkeypatch,
             t for t in revised["analysis"]["prepared_tracks"] if t["track_id"] == track["track_id"]
         )
         assert (workspace / prepared_track["path"]).is_file()
+
+
+@pytest.mark.parametrize("manual_remux", [False, True])
+def test_shared_edits_automatically_remux_finished_sibling(client, completed_job, environment, manual_remux):
+    from backend.app.services import reconcile
+    from tests.test_source_sharing import peer
+
+    sibling = peer(client)
+    ready(sibling["id"])
+    if manual_remux:
+        # Submit from the completed job: the editable sibling also inherits it.
+        response = client.post(
+            f"/api/jobs/{completed_job}/remux",
+            json={
+                **CHOICES,
+                "shared_revision": 1,
+                "audio_track_ids": [4, 8],
+                "track_languages": {"9": "jpn"},
+            },
+        )
+    else:
+        response = client.post(
+            f"/api/jobs/{sibling['id']}/tracks/selection",
+            json={
+                **CHOICES,
+                "shared_revision": 1,
+                "audio_track_ids": [4, 8],
+                "track_languages": {"9": "jpn"},
+            },
+        )
+    assert response.status_code in (200, 202), response.text
+    for job_id in (completed_job, sibling["id"]):
+        current = read(client, job_id)
+        assert current["track_selection"]["audio_track_ids"] == [4, 8]
+        assert next(t for t in current["tracks"] if t["track_id"] == 9)["info"]["language"] == "ja"
+    current = read(client, completed_job)
+    assert current["state"] == "PREPARING_TRACKS"
+    assert not current["shared_track_selection"]["pending"]
+    revision = current["analysis"]["remux_revision"]["id"]
+    assert (environment.completed_root / current["analysis"]["final_path"]).read_bytes() == b"previous mux"
+    with session() as db:
+        reconcile(db)
+        reconcile(db)
+    current = read(client, completed_job)
+    assert current["analysis"]["remux_revision"]["id"] == revision
+    assert [t["type"] for t in current["tasks"] if t["status"] == "QUEUED"] == ["prepare_tracks"]
+
+
+@pytest.mark.parametrize("stage", ["PREPARING_TRACKS", "REMUXING", "GENERATING_RELEASE"])
+def test_running_work_keeps_snapshot_then_remuxes_latest_shared_revision(client, completed_job, stage):
+    from backend.app.services import enqueue, reconcile
+    from shared.models import TrackSelection
+    from tests.test_source_sharing import peer
+
+    sibling = peer(client)
+    ready(sibling["id"])
+    with session() as db:
+        job = db.get(MovieJob, completed_job)
+        job.state = stage
+        job.analysis = {**job.analysis, "prepared_tracks": [{"track_id": 8, "path": "old.ac3"}]}
+        task = enqueue(db, job)
+        task.status, task.heartbeat_at = "RUNNING", now()
+        task_id = task.id
+        db.commit()
+    for revision, order in [(1, [4, 8]), (2, [4])]:
+        response = client.post(
+            f"/api/jobs/{sibling['id']}/tracks/selection",
+            json={
+                **CHOICES,
+                "shared_revision": revision,
+                "audio_track_ids": order,
+                "track_names": {"9": "Updated dialogue"},
+                "track_flags": {},
+            },
+        )
+        assert response.status_code == 200, response.text
+    current = read(client, completed_job)
+    assert current["track_selection"]["audio_track_ids"] == [4]
+    assert next(t for t in current["tracks"] if t["track_id"] == 9)["info"]["mux_name"] == "Updated dialogue"
+    assert current["shared_track_selection"]["remux_pending"]
+    with session() as db:
+        reconcile(db)
+        job = db.get(MovieJob, completed_job)
+        assert db.scalar(select(TrackSelection).where(TrackSelection.job_id == job.id)).audio_track_ids == [
+            8,
+            4,
+        ]
+        assert job.analysis["prepared_tracks"][0]["path"] == "old.ac3"
+        task = db.get(Task, task_id)
+        assert task.status == "RUNNING"
+        task.status = "SUCCEEDED"
+        db.flush()
+        advance(db, job)
+        db.commit()
+        reconcile(db)
+    current = read(client, completed_job)
+    assert current["state"] == "PREPARING_TRACKS"
+    assert current["shared_track_selection"]["applied_revision"] == 3
+    assert current["analysis"]["prepared_track_cache"]["8"]["path"] == "old.ac3"
+    assert [t["type"] for t in current["tasks"] if t["status"] == "QUEUED"] == ["prepare_tracks"]
+    with session() as db:
+        assert db.scalar(
+            select(TrackSelection).where(TrackSelection.job_id == completed_job)
+        ).audio_track_ids == [4]
+
+
+def test_manual_remux_also_remuxes_completed_peer(client, completed_job, environment):
+    from tests.test_source_sharing import peer
+
+    other = peer(client)
+    ready(other["id"])
+    workspace = environment.workspace_root / other["id"]
+    (workspace / "encoded.mkv").write_bytes(b"peer encode")
+    final = environment.completed_root / other["id"] / "peer.mkv"
+    final.parent.mkdir()
+    final.write_bytes(b"peer mux")
+    with session() as db:
+        job = db.get(MovieJob, other["id"])
+        job.state, job.validation = "COMPLETE", {"valid": True}
+        job.analysis = {**job.analysis, "encoded_path": "encoded.mkv", "final_path": f"{job.id}/peer.mkv"}
+        db.commit()
+    response = client.post(f"/api/jobs/{completed_job}/remux", json={**CHOICES, "shared_revision": 1})
+    assert response.status_code == 202, response.text
+    for job_id in (completed_job, other["id"]):
+        current = read(client, job_id)
+        assert current["state"] == "PREPARING_TRACKS"
+        assert current["track_selection"]["audio_track_ids"] == [8, 4]
+        assert [t["type"] for t in current["tasks"] if t["status"] == "QUEUED"] == ["prepare_tracks"]
+    assert final.read_bytes() == b"peer mux"

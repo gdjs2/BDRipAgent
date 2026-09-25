@@ -98,6 +98,23 @@ def metadata(request, progress):
     }, [warning]
 
 
+def movie_release_date(request, info):
+    """Prefer a verified movie date; never substitute the packaging day."""
+    record = {}
+    cache = request.get("release_date_cache")
+    if cache and Path(cache).is_file():
+        saved = json.loads(Path(cache).read_text())
+        if saved.get("imdb_id") == request.get("imdb_id"):
+            record = saved
+    value = record.get("release_date", info.get("release_date"))
+    try:
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("Missing full release date")
+        return date.fromisoformat(value).isoformat(), record.get("source_url") or info.get("imdb_url")
+    except ValueError:
+        return "Unknown", None
+
+
 def run(request, token):
     from bdrip.release import bbcode, media, nfo, screenshots
     from bdrip.release.pipeline import extract_encoder_info
@@ -140,6 +157,9 @@ def run(request, token):
                 temporary.unlink(missing_ok=True)
     info, warnings = metadata(request, progress)
     info["name"], info["year"] = request["title"], request["year"]
+    info["release_date"], date_source = movie_release_date(request, info)
+    if info["release_date"] == "Unknown":
+        warnings.append("Movie release date unavailable; RELEASE DATE is marked Unknown.")
     for warning in warnings:
         print(warning, flush=True)
     progress.report(12, "Reading final media information", indeterminate=True)
@@ -235,6 +255,7 @@ def run(request, token):
         "source": source,
         "encoder_info": encoder_info,
         "movie_description": details.get("movie_description", "").strip() or description,
+        "release_date": info["release_date"],
     }
     progress.report(35, "Generating BBCode and NFO", indeterminate=True)
     # render() otherwise always refetches IMDb, even with complete overrides. This
@@ -254,7 +275,7 @@ def run(request, token):
         "encoded_by": encoder,
         "imdb": info["imdb_url"],
         "source": source,
-        "release_date": date.today().isoformat(),
+        "release_date": info["release_date"],
         "hdr_format": None,
         "language": technical["languages"],
         "framerate": technical["frame_rate"],
@@ -286,6 +307,8 @@ def run(request, token):
         raise RuntimeError("Final media changed while generating the release")
     result = {
         "infohash": infohash,
+        "movie_release_date": info["release_date"],
+        "movie_release_date_source": date_source,
         "md5": checksum,
         "uploaded_images": total if upload_enabled else 0,
         "upload_screenshots": upload_enabled,

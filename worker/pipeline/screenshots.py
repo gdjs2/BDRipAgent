@@ -10,7 +10,8 @@ from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import delete, select
 
 from agent.schemas import Selection, review_policy, validate_selection
-from shared.config import ScreenshotPolicy, behavior
+from shared.agent_prompts import default_text, task_prompts
+from shared.config import ScreenshotPolicy, behavior, screenshot_selection_limits
 from shared.db import session
 from shared.encoding import is_smoke_test
 from shared.models import AgentRun, MovieJob, Screenshot, Task
@@ -97,13 +98,13 @@ def contact_sheets(candidates, image_root, output_root):
     return sheets
 
 
-def sampling_windows(duration, target, attempts, window_seconds):
+def sampling_windows(duration, target, attempts, window_seconds, *, pass_offset=0):
     """One position per timeline bucket per pass, then fill unsuccessful buckets."""
     bucket_seconds = duration / target
     for attempt in range(attempts):
         # Centre first, then alternate positions inside each bucket. Every pass
         # covers the entire movie, including when quality checks reject a region.
-        fraction = (0.5 + attempt * 0.38196601125) % 1
+        fraction = (0.5 + (attempt + pass_offset) * 0.38196601125) % 1
         for bucket in range(target):
             anchor = min(duration - 0.05, (bucket + fraction) * bucket_seconds)
             yield (
@@ -169,20 +170,43 @@ def window_candidate(ctx, frames, points, crop, config, *, bucket, anchor):
     return winner
 
 
-def generate(ctx):
+def sample_candidates(ctx, *, existing=(), sampling_round=0, reserved=(), target=None):
+    if not hasattr(ctx, "settings"):
+        return scan_candidates(
+            ctx, existing=existing, sampling_round=sampling_round, reserved=reserved, target=target
+        )
+    from worker.adapters.screenshot_pool import shared_sample
+
+    return shared_sample(
+        ctx,
+        scan_candidates,
+        existing=existing,
+        sampling_round=sampling_round,
+        reserved=reserved,
+        target=target,
+    )
+
+
+def scan_candidates(ctx, *, existing=(), sampling_round=0, reserved=(), target=None, source_only=False):
     ctx.progress(None, phase="Preparing screenshot frame index")
     config, crop = behavior(), Crop(**ctx.job.analysis["crop"])
     points, frame_index_path = source_frame_index(ctx)
     first_pts = ctx.job.validation["metrics"]["source_first_pts"]
     duration = float(points[-1] - first_pts + points[-1] - points[-2])
-    target = max(1, int(config["candidate_count"]))
+    target = max(1, int(config["candidate_count"] if target is None else target))
     attempts = max(1, int(config.get("candidate_attempts_per_bucket", 4)))
     window_seconds = max(3.0, float(config.get("candidate_window_seconds", 3)))
-    candidates, filled = [], set()
+    candidates, filled = list(existing), set()
+    initial_count = len(candidates)
+    id_offset = max(
+        (c["candidate_id"] for c in candidates), default=sampling_round * int(config["candidate_count"])
+    )
     stats = {
+        "sampling_round": sampling_round,
         "decoded_frames": 0,
         "sampled_windows": 0,
         "target_candidates": target,
+        "existing_candidates": initial_count,
         "source_total_frames": len(points),
     }
     started, progress = time.monotonic(), 5.0
@@ -191,17 +215,25 @@ def generate(ctx):
         "Stop after enough distinct, verified B-frame pairs; no sequential movie decode."
     )
     with candidate_decoder(ctx) as (container, _, decoder_info):
-        for bucket, start, anchor, end in sampling_windows(duration, target, attempts, window_seconds):
+        for bucket, start, anchor, end in sampling_windows(
+            duration, target, attempts, window_seconds, pass_offset=sampling_round * attempts
+        ):
             ctx.check()
             if bucket in filled:
                 continue
             stats["sampled_windows"] += 1
             frames = window_frames(ctx, container, first_pts + start, first_pts + end, stats)
             try:
-                candidate = window_candidate(ctx, frames, points, crop, config, bucket=bucket, anchor=anchor)
+                candidate = window_candidate(
+                    ctx, frames, points, crop, config, bucket=bucket + id_offset, anchor=anchor
+                )
             finally:
                 frames.close()
-            eligible = verify_b_frame_candidates(ctx, [candidate], report=False) if candidate else []
+            eligible = (
+                verify_b_frame_candidates(ctx, [candidate], report=False, source_only=source_only)
+                if candidate
+                else []
+            )
             for candidate in eligible:
                 value = int(candidate["metrics"]["hash"], 16)
                 duplicate = any(
@@ -210,7 +242,7 @@ def generate(ctx):
                     < config["duplicate_hash_distance"]
                     for other in candidates
                 )
-                if duplicate:
+                if duplicate or conflicts(candidate, reserved):
                     contained(ctx.workspace, candidate["path"]).unlink(missing_ok=True)
                     continue
                 filled.add(bucket)
@@ -220,17 +252,18 @@ def generate(ctx):
                 )
             progress = max(
                 progress,
-                5 + 90 * len(candidates) / target,
+                5 + 90 * (len(candidates) - initial_count) / target,
                 5 + 90 * stats["sampled_windows"] / (target * attempts),
             )
             ctx.progress(
                 progress,
                 phase="Sampling short video windows",
-                candidate_count=len(candidates),
+                candidate_count=len(candidates) - initial_count,
+                total_candidates=len(candidates),
                 **stats,
                 **decoder_info,
             )
-            if len(candidates) >= target:
+            if len(candidates) - initial_count >= target:
                 break
     candidates.sort(key=lambda c: c["timeline_seconds"])
     decoder_info = {
@@ -240,7 +273,7 @@ def generate(ctx):
         "elapsed_seconds": round(time.monotonic() - started, 2),
     }
     ctx.log(
-        f"Screenshot sampling retained {len(candidates)} candidates from {stats['sampled_windows']} windows; "
+        f"Screenshot sampling added {len(candidates) - initial_count} candidates from {stats['sampled_windows']} windows ({len(candidates)} total); "
         f"decoded {stats['decoded_frames']} scan frames instead of all {len(points)} source frames "
         f"in {decoder_info['elapsed_seconds']:.1f}s (plus short CPU B-frame verification seeks)."
     )
@@ -262,24 +295,62 @@ def generate(ctx):
     for sheet in sheets:
         ctx.artifact(sheets_root / sheet, "CONTACT_SHEET")
     path = ctx.output("screenshots", "candidates.json")
-    write_json(
-        path,
-        {
-            "decoder": decoder_info,
-            "candidates": candidates,
-            "contact_sheets": [str((sheets_root / s).relative_to(ctx.workspace)) for s in sheets],
-        },
-    )
+    index = {
+        "decoder": decoder_info,
+        "candidates": candidates,
+        "contact_sheets": [str((sheets_root / s).relative_to(ctx.workspace)) for s in sheets],
+    }
+    write_json(path, index)
     relative = ctx.artifact(path, "CANDIDATE_INDEX")
+    return index, relative, frame_index_path
+
+
+def generate(ctx):
+    sampling_round = (
+        ctx.job.analysis.get("screenshot_scan_decoder", {}).get(
+            "sampling_round", 0 if ctx.job.analysis.get("candidate_index") else -1
+        )
+        + 1
+    )
+    with session() as db:
+        reserved = other_variant_frames(db, ctx.job) if getattr(ctx.job, "id", None) else []
+    append = ctx.job.analysis.get("screenshot_append")
+    existing = []
+    if append:
+        existing = json.loads(
+            contained(ctx.workspace, ctx.job.analysis["candidate_index"], exists=True).read_text()
+        )["candidates"]
+    options = {"existing": existing, "target": append["count"]} if append else {}
+    index, relative, frame_index_path = sample_candidates(
+        ctx, sampling_round=sampling_round, reserved=reserved, **options
+    )
+    candidates, decoder_info = index["candidates"], index["decoder"]
 
     def save(db, job):
-        db.execute(delete(Screenshot).where(Screenshot.job_id == job.id))
-        for c in candidates:
-            db.add(Screenshot(job_id=job.id, candidate_id=c["candidate_id"], info=c))
+        if append:
+            rows = {
+                r.candidate_id: r for r in db.scalars(select(Screenshot).where(Screenshot.job_id == job.id))
+            }
+            new_ids = []
+            for c in candidates:
+                if c["candidate_id"] not in rows:
+                    db.add(Screenshot(job_id=job.id, candidate_id=c["candidate_id"], info=c))
+                    new_ids.append(c["candidate_id"])
+            job.analysis = {**job.analysis, "screenshot_append": {**append, "candidate_ids": new_ids}}
+        else:
+            # Confirmed finals still reserve their frames until the user replaces them.
+            db.execute(delete(Screenshot).where(Screenshot.job_id == job.id, Screenshot.selected.is_(False)))
+            for row in db.scalars(select(Screenshot).where(Screenshot.job_id == job.id)):
+                row.shortlisted = False
+                row.info = {**row.info, "recommendation_rank": None}
+            for c in candidates:
+                db.add(Screenshot(job_id=job.id, candidate_id=c["candidate_id"], info=c))
         job.analysis = {
             **job.analysis,
             "candidate_index": relative,
             "screenshot_scan_decoder": decoder_info,
+            "screenshot_shared_revision": decoder_info.get("shared_revision", 0),
+            "screenshot_shared_seen": decoder_info.get("shared_seen", []),
             "source_frame_index": frame_index_path,
         }
 
@@ -287,13 +358,25 @@ def generate(ctx):
 
 
 def select_frames(ctx):
+    if ctx.job.analysis.get("screenshot_append"):
+        return append_shortlist(ctx)
     steps = plan(ctx, preparation=25, agent=35, comparisons=35, thumbnails=5)
     steps["preparation"].progress(None, phase="Preparing screenshot review")
     index = json.loads(contained(ctx.workspace, ctx.job.analysis["candidate_index"], exists=True).read_text())
     root = job_dir(job_dir(ctx.settings.cache_root / "agent", ctx.job.id), ctx.task_id)
     root.mkdir(parents=True, exist_ok=True)
     candidates = index["candidates"]
-    reused_ids = ctx.job.analysis.get("review_shortlisted_ids", [])
+    strategy = ctx.job.screenshot_policy.get("strategy", "local")
+    reused_ids = ctx.job.analysis.get("review_shortlisted_ids", []) if strategy == "agent" else []
+    if strategy == "agent":
+        selected_prompt = task_prompts(ctx)["screenshot_selection"]
+        prior_hash = ctx.job.analysis.get("screenshot_review", {}).get("prompt_sha256")
+        if prior_hash != selected_prompt["sha256"] and (
+            prior_hash is not None or selected_prompt["text"] != default_text("screenshot_selection")
+        ):
+            reused_ids = []
+    if len(reused_ids) < ctx.job.screenshot_policy.get("best_count", 30) or len(reused_ids) > 40:
+        reused_ids = []
     shortlisted_choices = []
     if reused_ids:
         with session() as db:
@@ -351,59 +434,28 @@ def select_frames(ctx):
         raise ValueError(
             "Too few verified B-frame pairs remain after excluding nearby frames from the other codec"
         )
-    for c in candidates:
-        # Only source-derived image data crosses into the agent service's read-only mount.
-        source = contained(ctx.workspace, c["path"], exists=True)
-        target = root / f"candidate-{c['candidate_id']:03d}.png"
-        shutil.copyfile(source, target)
-        c["agent_image"] = target.name
-    # Rebuild sheets so excluded frames cannot enter the visual shortlist.
-    sheets = contact_sheets(candidates, ctx.workspace, root)
-    duration = ctx.job.validation["metrics"]["source_duration"]
-    write_json(
-        root / "inventory.json",
-        {
-            "candidates": candidates,
-            "contact_sheets": sheets,
-            "policy": ctx.job.screenshot_policy,
-            "duration": duration,
-            "shortlisted_ids": [c["candidate_id"] for c in candidates] if reused_ids else [],
-            "shortlisted_choices": shortlisted_choices,
-        },
-    )
-    timeout = behavior()["agent"]["timeout_seconds"] * (len(sheets) + 5)
-    steps["preparation"].done("Screenshot review inputs ready")
-    result = select_screenshots(steps["agent"], timeout)
-    steps["agent"].done("Screenshot agent review complete")
+    if strategy == "local":
+        steps["preparation"].done("Locally filtered candidates ready")
+        result = local_selection(candidates, ctx.job.screenshot_policy)
+        steps["agent"].done("Local filtering complete — choose Best manually")
+    else:
+        candidates, result = agent_review(
+            ctx, steps, candidates, index, root, reused_ids, shortlisted_choices
+        )
     ctx.check()
     shortlist = result["shortlisted_ids"]
-    candidate_ids = {c["candidate_id"] for c in candidates}
-    if (
-        not shortlist
-        or len(shortlist) > 40
-        or len(set(shortlist)) != len(shortlist)
-        or not set(shortlist) <= candidate_ids
-    ):
-        raise ValueError("Invalid agent shortlist")
-    selection = Selection.model_validate({"selected": result["selected"]})
-    errors = validate_selection(
-        selection,
-        [c for c in candidates if c["candidate_id"] in shortlist],
-        review_policy(ScreenshotPolicy(**ctx.job.screenshot_policy), len(shortlist)),
-        duration,
+    path = ctx.output(
+        "screenshots/selected", "local-result.json" if strategy == "local" else "agent-result.json"
     )
-    if errors:
-        raise ValueError("Invalid agent decision: " + "; ".join(errors))
-    path = ctx.output("screenshots/selected", "agent-result.json")
     write_json(path, result)
-    ctx.artifact(path, "AGENT_DECISION")
+    ctx.artifact(path, "SCREENSHOT_LOCAL_DECISION" if strategy == "local" else "AGENT_DECISION")
     recommendations = {c["candidate_id"]: c for c in result["selected"]}
     review_rows = [
         SimpleNamespace(id=c["candidate_id"], candidate_id=c["candidate_id"], info=c)
         for c in candidates
         if c["candidate_id"] in recommendations
     ]
-    comparisons = render_pairs(steps["comparisons"], review_rows, review=True)
+    comparisons = render_pairs(steps["comparisons"], review_rows, review=True) if review_rows else {}
     steps["comparisons"].done("Review comparisons ready")
     steps["thumbnails"].progress(None, phase="Preparing shortlist thumbnails")
     for candidate in candidates:
@@ -421,7 +473,15 @@ def select_frames(ctx):
         choices.update(recommendations)
         ranks = {c["candidate_id"]: rank for rank, c in enumerate(result["selected"], 1)}
         verified = {c["candidate_id"]: c for c in candidates}
-        for row in db.scalars(select(Screenshot).where(Screenshot.job_id == job.id)):
+        rows = {
+            row.candidate_id: row for row in db.scalars(select(Screenshot).where(Screenshot.job_id == job.id))
+        }
+        for candidate_id, info in verified.items():
+            if candidate_id not in rows:
+                row = Screenshot(job_id=job.id, candidate_id=candidate_id, info=info)
+                db.add(row)
+                rows[candidate_id] = row
+        for row in rows.values():
             if row.candidate_id in verified:
                 row.info = {**row.info, **verified[row.candidate_id]}
             row.shortlisted = row.candidate_id in result["shortlisted_ids"]
@@ -432,11 +492,210 @@ def select_frames(ctx):
             }
             if row.candidate_id in comparisons:
                 row.info = {**row.info, "review_comparisons": comparisons[row.candidate_id]}
-        db.add(AgentRun(job_id=job.id, task_id=ctx.task_id, result=result))
-        job.codex_thread_id = result.get("thread_id")
-        job.analysis = {k: v for k, v in job.analysis.items() if k != "review_shortlisted_ids"}
+        if strategy == "agent":
+            db.add(AgentRun(job_id=job.id, task_id=ctx.task_id, result=result))
+            job.codex_thread_id = result.get("thread_id")
+        job.analysis = {
+            **{k: v for k, v in job.analysis.items() if k != "review_shortlisted_ids"},
+            "screenshot_review": {
+                "strategy": strategy,
+                "prompt_sha256": result.get("prompt_sha256"),
+                "requested": ctx.job.screenshot_policy.get("best_count", 30) if strategy == "agent" else 0,
+                "available": len(result["selected"]),
+                "candidate_count": len(candidates),
+                "warning": result.get("warning"),
+            },
+        }
 
     return save
+
+
+def append_shortlist(ctx):
+    """Publish only the newly sampled frames; never rank or replace human choices."""
+    request = ctx.job.analysis["screenshot_append"]
+    ids = set(request.get("candidate_ids", []))
+    index = json.loads(contained(ctx.workspace, ctx.job.analysis["candidate_index"], exists=True).read_text())
+    additions = [c for c in index["candidates"] if c["candidate_id"] in ids]
+    updates = {}
+    for i, c in enumerate(additions):
+        ctx.check()
+        if not is_b_frame_pair(c):
+            raise ValueError("Additional screenshots must be verified B-frame pairs")
+        thumbnail = ctx.output("screenshots/thumbnails", f"candidate-{c['candidate_id']:03d}.jpg")
+        with Image.open(contained(ctx.workspace, c["path"], exists=True)) as image:
+            image.thumbnail((640, 360))
+            image.convert("RGB").save(thumbnail, quality=85)
+        updates[c["candidate_id"]] = {
+            **c,
+            "thumbnail": ctx.artifact(thumbnail, "SCREENSHOT_THUMBNAIL"),
+            "recommendation_rank": None,
+        }
+        ctx.progress(
+            (i + 1) / len(additions) * 100,
+            phase="Adding new shortlist frames",
+            completed_candidates=i + 1,
+            total_candidates=len(additions),
+        )
+
+    def save(db, job):
+        for row in db.scalars(
+            select(Screenshot).where(Screenshot.job_id == job.id, Screenshot.candidate_id.in_(ids))
+        ):
+            row.info = {**row.info, **updates[row.candidate_id]}
+            row.shortlisted = True
+        job.analysis = {
+            **{
+                k: v
+                for k, v in job.analysis.items()
+                if k not in ("screenshot_append", "review_shortlisted_ids")
+            },
+            "screenshot_more": {
+                "requested": request["count"],
+                "added": len(additions),
+                "candidate_ids": sorted(ids),
+                "warning": f"Found {len(additions)} of {request['count']} additional quality frames. You can request another batch."
+                if len(additions) < request["count"]
+                else None,
+            },
+        }
+
+    return save
+
+
+def local_selection(candidates, policy):
+    """Expose the filtered pool; only the user can add local candidates to Best."""
+    return {
+        "strategy": "local",
+        "shortlisted_ids": [c["candidate_id"] for c in candidates],
+        "selected": [],
+        "warning": None,
+    }
+
+
+def checkpoint_pool(ctx, index, relative):
+    """Keep expensive frame work across failed or timed-out agent requests."""
+    with session() as db:
+        job = db.scalar(select(MovieJob).where(MovieJob.id == ctx.job.id).with_for_update())
+        task = db.scalar(select(Task).where(Task.id == ctx.task_id).with_for_update())
+        if task.status != "RUNNING" or task.run_token != ctx.token or task.cancel_requested:
+            raise Interrupted("Task lost its lease before saving screenshot candidates")
+        rows = {r.candidate_id: r for r in db.scalars(select(Screenshot).where(Screenshot.job_id == job.id))}
+        for c in index["candidates"]:
+            if c["candidate_id"] not in rows:
+                db.add(Screenshot(job_id=job.id, candidate_id=c["candidate_id"], info=c))
+        job.analysis = {
+            **job.analysis,
+            "candidate_index": relative,
+            "screenshot_scan_decoder": index["decoder"],
+            "screenshot_shared_revision": index["decoder"].get("shared_revision", 0),
+            "screenshot_shared_seen": index["decoder"].get("shared_seen", []),
+        }
+        db.commit()
+    ctx.job.analysis = {**ctx.job.analysis, "candidate_index": relative}
+
+
+class ScreenshotDeadline:
+    def __init__(self, ctx, deadline):
+        self.ctx, self.deadline = ctx, deadline
+
+    def __getattr__(self, name):
+        return getattr(self.ctx, name)
+
+    def check(self):
+        self.ctx.check()
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError(
+                "Screenshot selection reached its configured time limit; prepared candidates are retained"
+            )
+
+
+def agent_review(ctx, steps, candidates, index, root, reused_ids, shortlisted_choices):
+    limits = screenshot_selection_limits()
+    deadline = time.monotonic() + limits["max_seconds"]
+    ctx = ScreenshotDeadline(ctx, deadline)
+    steps = {name: ScreenshotDeadline(step, deadline) for name, step in steps.items()}
+    sampling_round = index.get("decoder", {}).get("sampling_round", 0)
+    previous = index.get("agent_progress", {})
+    selected_prompt = task_prompts(ctx)["screenshot_selection"]
+    if previous.get("prompt_sha256") != selected_prompt["sha256"]:
+        previous = {}
+    for review_round in range(limits["max_sampling_rounds"]):
+        ctx.check()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Screenshot selection reached its configured time limit; prepared candidates are retained"
+            )
+        for c in candidates:
+            target = root / f"candidate-{c['candidate_id']:03d}.png"
+            shutil.copyfile(contained(ctx.workspace, c["path"], exists=True), target)
+            c["agent_image"] = target.name
+        sheets = contact_sheets(candidates, ctx.workspace, root)
+        final_round = review_round == limits["max_sampling_rounds"] - 1
+        write_json(
+            root / "inventory.json",
+            {
+                "candidates": candidates,
+                "contact_sheets": sheets,
+                "policy": ctx.job.screenshot_policy,
+                "duration": ctx.job.validation["metrics"]["source_duration"],
+                "shortlisted_ids": [c["candidate_id"] for c in candidates] if reused_ids else [],
+                "agent_prompt": selected_prompt,
+                "shortlisted_choices": previous.get("shortlisted_choices", shortlisted_choices),
+                "reviewed_candidate_ids": previous.get("reviewed_candidate_ids", []),
+                "allow_partial": final_round,
+                "remaining_seconds": max(1, deadline - time.monotonic()),
+            },
+        )
+        steps["agent"].progress(
+            None,
+            phase="Agent screenshot review",
+            sampling_round=review_round + 1,
+            target_best_count=ctx.job.screenshot_policy.get("best_count", 30),
+            candidate_count=len(candidates),
+        )
+        result = select_screenshots(steps["agent"], max(1, deadline - time.monotonic()))
+        result["prompt_sha256"] = selected_prompt["sha256"]
+        if result.get("needs_more_candidates") and not final_round:
+            previous = result
+            sampling_round += 1
+            reused_ids = []
+            with session() as db:
+                reserved = other_variant_frames(db, ctx.job)
+            ctx.log(
+                "Not enough suitable screenshots; sampling fresh timeline windows and retaining reviewed candidates."
+            )
+            index, relative, _ = sample_candidates(
+                steps["preparation"], existing=candidates, sampling_round=sampling_round, reserved=reserved
+            )
+            candidates = index["candidates"]
+            index["agent_progress"] = previous
+            write_json(contained(ctx.workspace, relative), index)
+            checkpoint_pool(ctx, index, relative)
+            continue
+        shortlist = result["shortlisted_ids"]
+        if (
+            not shortlist
+            or len(shortlist) > 40
+            or len(set(shortlist)) != len(shortlist)
+            or not set(shortlist) <= {c["candidate_id"] for c in candidates}
+        ):
+            raise ValueError("Invalid agent shortlist")
+        errors = validate_selection(
+            Selection.model_validate({"selected": result["selected"]}),
+            [c for c in candidates if c["candidate_id"] in shortlist],
+            review_policy(ScreenshotPolicy(**ctx.job.screenshot_policy), len(shortlist)),
+            ctx.job.validation["metrics"]["source_duration"],
+        )
+        if errors:
+            raise ValueError("Invalid agent decision: " + "; ".join(errors))
+        if len(result["selected"]) < ctx.job.screenshot_policy.get("best_count", 30):
+            result["warning"] = (
+                "Sampling limit reached before enough suitable frames were found. Review the available choices or increase the sampling limit."
+            )
+        steps["preparation"].done("Screenshot review inputs ready")
+        steps["agent"].done("Screenshot agent review complete")
+        return candidates, result
+    raise ValueError("Screenshot sampling limit reached")
 
 
 def extract_at(path, pts_seconds, tolerance):
@@ -483,10 +742,12 @@ def nearby_source_frames(path, pts_seconds, tolerance=0.003):
             raise ValueError(f"Cannot locate source candidate at PTS {pts_seconds:.6f}")
 
 
-def verify_b_frame_candidates(ctx, candidates, *, progress_start=0, progress_span=90, report=True):
+def verify_b_frame_candidates(
+    ctx, candidates, *, progress_start=0, progress_span=90, report=True, source_only=False, exact=False
+):
     """Refine scan candidates to nearby pairs with CPU-verified B-picture types."""
     source = ctx.source()
-    smoke = is_smoke_test(ctx.job)
+    smoke = source_only or is_smoke_test(ctx.job)
     encoded = source if smoke else contained(ctx.workspace, ctx.job.analysis["encoded_path"], exists=True)
     metrics = ctx.job.validation["metrics"]
     crop, config = Crop(**ctx.job.analysis["crop"]), behavior()
@@ -503,6 +764,8 @@ def verify_b_frame_candidates(ctx, candidates, *, progress_start=0, progress_spa
         window = nearby_source_frames(source, pts)
         try:
             for offset, source_frame in window:
+                if exact and offset:
+                    break
                 ctx.check()
                 # Reject scene changes while looking for a nearby B-frame pair.
                 image = cropped_image(source_frame, crop, ctx.job.analysis["video"])
@@ -514,7 +777,11 @@ def verify_b_frame_candidates(ctx, candidates, *, progress_start=0, progress_spa
                 if int(source_frame.pict_type) != 3 or not acceptable(quality, config):
                     continue
                 source_pts = float(source_frame.pts * source_frame.time_base)
-                encoded_pts = source_pts - metrics["source_first_pts"] + metrics["encoded_first_pts"]
+                encoded_pts = (
+                    source_pts
+                    if source_only
+                    else source_pts - metrics["source_first_pts"] + metrics["encoded_first_pts"]
+                )
                 encoded_frame = source_frame if smoke else extract_at(encoded, encoded_pts, 0.003)
                 if int(encoded_frame.pict_type) != 3:
                     continue
@@ -673,5 +940,42 @@ def render(ctx):
             row = db.get(Screenshot, shot_id)
             row.info = {**row.info, "comparisons": paths}
         job.analysis = {k: v for k, v in job.analysis.items() if k != "release_result"}
+
+    return save
+
+
+def sync_shared_pool(ctx):
+    from worker.adapters.screenshot_pool import shared_sample
+
+    with session() as db:
+        existing = [
+            dict(r.info) for r in db.scalars(select(Screenshot).where(Screenshot.job_id == ctx.job.id))
+        ]
+    index, relative, _ = shared_sample(ctx, scan_candidates, existing=existing, sync_only=True)
+    old_ids = {c["candidate_id"] for c in existing}
+    added = [c for c in index["candidates"] if c["candidate_id"] not in old_ids]
+    for c in added:
+        thumbnail = ctx.output("screenshots/thumbnails", f"candidate-{c['candidate_id']:03d}.jpg")
+        with Image.open(contained(ctx.workspace, c["path"], exists=True)) as image:
+            image.thumbnail((640, 360))
+            image.convert("RGB").save(thumbnail, quality=85)
+        c["thumbnail"] = ctx.artifact(thumbnail, "SCREENSHOT_THUMBNAIL")
+        c["recommendation_rank"] = None
+
+    def save(db, job):
+        for c in added:
+            db.add(Screenshot(job_id=job.id, candidate_id=c["candidate_id"], info=c, shortlisted=True))
+        job.analysis = {
+            **job.analysis,
+            "candidate_index": relative,
+            "screenshot_shared_revision": index["decoder"]["shared_revision"],
+            "screenshot_shared_seen": index["decoder"]["shared_seen"],
+            "screenshot_more": {
+                "requested": len(added),
+                "added": len(added),
+                "candidate_ids": [c["candidate_id"] for c in added],
+                "warning": None,
+            },
+        }
 
     return save

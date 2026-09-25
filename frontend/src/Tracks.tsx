@@ -17,9 +17,26 @@ import {
   unresolvedFlags,
 } from "./track-selection";
 
+function movieLanguageCodes(job: Job) {
+  return (
+    job.original_languages?.map((item) => item.code) ??
+    job.subtitle_discovery?.policy.original_languages ??
+    []
+  );
+}
+
+function languageBase(code: string) {
+  try {
+    return new Intl.Locale(code).language;
+  } catch {
+    return undefined;
+  }
+}
+
 function sharedChoiceKey(job: Job) {
   return JSON.stringify({
     selection: job.track_selection,
+    originals: movieLanguageCodes(job),
     revision: job.shared_track_selection?.revision ?? 0,
     applied: job.shared_track_selection?.applied_revision ?? 0,
   });
@@ -27,6 +44,9 @@ function sharedChoiceKey(job: Job) {
 
 export function Tracks({ job }: { job: Job }) {
   const query = useQueryClient();
+  const [originals, setOriginals] = useState(
+    movieLanguageCodes(job).join(", "),
+  );
   const [audio, setAudio] = useState<number[]>(
     job.track_selection?.audio_track_ids ?? [],
   );
@@ -92,7 +112,12 @@ export function Tracks({ job }: { job: Job }) {
     ].includes(job.state);
   const complete = analysisComplete(job);
   const attempted = hasAnalysisAttempt(job);
-  const refresh = () => query.invalidateQueries({ queryKey: ["job", job.id] });
+  const refresh = () =>
+    Promise.all([
+      query.invalidateQueries({ queryKey: ["job"] }),
+      query.invalidateQueries({ queryKey: ["jobs"] }),
+      query.invalidateQueries({ queryKey: ["queue"] }),
+    ]);
   const ensure = useMutation({
     mutationFn: () => api(`/jobs/${job.id}/tracks/analyze`, {}),
     onSuccess: refresh,
@@ -147,6 +172,7 @@ export function Tracks({ job }: { job: Job }) {
         `/jobs/${job.id}/${remuxEditing ? "remux" : "tracks/selection"}`,
         {
           shared_revision: loadedRevision,
+          original_languages: originals.split(/[,\s]+/).filter(Boolean),
           audio_track_ids: ordering.groups.audio
             .filter((t) => audio.includes(t.track_id))
             .map((t) => t.track_id),
@@ -185,6 +211,7 @@ export function Tracks({ job }: { job: Job }) {
       ),
     onSuccess: (updated) => {
       setRemuxEditing(false);
+      setOriginals(movieLanguageCodes(updated).join(", "));
       setLanguages({});
       setVerifiedLanguages({});
       setLanguageErrors({});
@@ -217,6 +244,7 @@ export function Tracks({ job }: { job: Job }) {
       return;
     syncedChoices.current = remoteChoices;
     const current = JSON.parse(remoteChoices);
+    setOriginals(current.originals.join(", "));
     setAudio(current.selection?.audio_track_ids ?? []);
     setSubs(current.selection?.subtitle_track_ids ?? []);
     setNames({});
@@ -231,6 +259,7 @@ export function Tracks({ job }: { job: Job }) {
     (dirty || ordering.changed) &&
     loadedRevision !== (job.shared_track_selection?.revision ?? 0);
   function loadSharedChoices() {
+    setOriginals(movieLanguageCodes(job).join(", "));
     syncedChoices.current = remoteChoices;
     setAudio(job.track_selection?.audio_track_ids ?? []);
     setSubs(job.track_selection?.subtitle_track_ids ?? []);
@@ -308,7 +337,8 @@ export function Tracks({ job }: { job: Job }) {
           <p>
             Reuse the encoded video and retained tracks. After remuxing,
             regenerate BBCode, torrent, MD5, and NFO in the Release tab.
-            Previous outputs{" "}
+            Replaced videos are deleted after the new video succeeds. Other old
+            release files{" "}
             {job.remux.backup_days
               ? `are kept for ${job.remux.backup_days} days after replacement`
               : "are kept until manually deleted"}
@@ -336,13 +366,15 @@ export function Tracks({ job }: { job: Job }) {
       )}
       <p className="muted">
         Track choices, order, names, flags, and language codes are shared across
-        encodes of this source. Each encode keeps its saved choices once
-        preparation for remux starts.
+        encodes of this source. Finished videos remux automatically; busy jobs
+        apply the changes after their current work finishes.
       </p>
       {job.shared_track_selection?.pending && (
         <p className={job.shared_track_selection.error ? "error" : "muted"}>
           {job.shared_track_selection.error ??
-            "Shared choices will apply automatically when this track review finishes."}
+            (job.shared_track_selection.remux_pending
+              ? "Showing the latest shared choices. Automatic remux is pending; the current video still uses its previous tracks."
+              : "Shared choices will apply automatically when this track review finishes.")}
         </p>
       )}
       {staleChoices && (
@@ -499,6 +531,43 @@ export function Tracks({ job }: { job: Job }) {
           </small>
         </section>
       )}
+      <div className="movie-languages">
+        <label htmlFor="movie-original-languages">
+          Movie’s original language codes
+        </label>
+        <input
+          id="movie-original-languages"
+          value={originals}
+          disabled={!enabled || save.isPending}
+          placeholder="e.g. en, ko, zh or yue"
+          onChange={(event) => {
+            setOriginals(event.target.value);
+            setDirty(true);
+          }}
+          aria-describedby="original-language-help"
+        />
+        <p className="muted" id="original-language-help">
+          Video always gets the Original language flag. Audio and subtitles get
+          it when their language matches. Saved with your track choices for all
+          encodes of this source.
+          {job.original_languages?.length
+            ? ` Verified codes: ${job.original_languages.map((item) => `${item.name} (${item.code})`).join(", ")}.`
+            : ""}
+        </p>
+        {!originals.trim() && (
+          <p className="attention-text">
+            Set the movie’s original language to identify matching audio and
+            subtitles. Source flags are not used to guess it.
+          </p>
+        )}
+        <span className="track-chip original-language">
+          Video · Original language
+        </span>
+        <small className="muted">
+          {" "}
+          Flags shown below apply on the next remux.
+        </small>
+      </div>
       <p className="sr-only" role="status" aria-live="polite">
         {ordering.announcement}
       </p>
@@ -537,6 +606,13 @@ export function Tracks({ job }: { job: Job }) {
             const name = editableChoices
               ? (names[id] ?? info.name_override ?? suggested)
               : (info.mux_name ?? suggested);
+            const base = languageBase(verified?.code ?? info.language);
+            const original =
+              base &&
+              originals
+                .split(/[,\s]+/)
+                .filter(Boolean)
+                .some((code) => languageBase(code) === base);
             const missing = unresolvedFlags(track, overrides);
             const detection = info.subtitle_detection;
             const description =
@@ -605,6 +681,14 @@ export function Tracks({ job }: { job: Job }) {
                           info.language}{" "}
                         ({verified?.code ?? info.language}) · {info.codec}
                       </span>
+                      {original && (
+                        <span
+                          className="track-chip original-language"
+                          title="Language matches the movie’s original language; set automatically during remux"
+                        >
+                          Original language
+                        </span>
+                      )}
                       {trackFlagLabels
                         .filter(([key]) => effective[key])
                         .map(([key, label]) => (

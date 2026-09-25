@@ -100,7 +100,7 @@ def main():
         extra = client.post(
             "/api/jobs", json={"source_path": "Fixture.mkv", "title": "Remove fixture", "year": 2026}
         ).json()
-        assert client.delete(f"/api/jobs/{extra['id']}?confirm={extra['id']}").json()["files_retained"]
+        assert not client.delete(f"/api/jobs/{extra['id']}?confirm={extra['id']}").json()["files_retained"]
         assert not status()["queued"]
         assert (get_settings().source_root / "Fixture.mkv").is_file()
         print(

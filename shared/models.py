@@ -211,3 +211,11 @@ class Event(Base):
     type: Mapped[str] = mapped_column(String(50))
     data: Mapped[dict] = mapped_column(DATA, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgentPrompt(Base):
+    __tablename__ = "agent_prompts"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    text: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

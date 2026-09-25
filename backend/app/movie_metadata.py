@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from shared.config import get_settings
 from shared.naming import release_name
+from shared.original_languages import canonical_languages
 
 _cache = OrderedDict()
 _cache_lock = threading.Lock()
@@ -126,6 +127,7 @@ def normalize_movie(imdb_id, raw):
         "url": f"https://www.imdb.com/title/{imdb_id}/",
         "title_options": options,
         "original_title": raw.get("title"),
+        "original_languages": canonical_languages(raw.get("original_languages")),
         "provider": "imdbinfo 0.9.1",
         "fetched_at": datetime.now(UTC).isoformat(),
     }

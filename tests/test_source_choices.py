@@ -158,7 +158,7 @@ def test_pending_review_and_future_jobs_apply_choices_without_another_confirmati
     assert read(client, future["id"])["track_selection"]["subtitle_track_ids"] == [12, 9]
 
 
-def test_preparation_freezes_choices_and_changed_or_deleted_sources_are_isolated(
+def test_unavailable_encode_defers_remux_and_changed_or_deleted_sources_are_isolated(
     client, new_job, environment
 ):
     ready(new_job["id"])
@@ -187,9 +187,15 @@ def test_preparation_freezes_choices_and_changed_or_deleted_sources_are_isolated
         == 200
     )
     current = read(client, frozen["id"])
-    assert (
-        current["tracks"] == snapshot["tracks"] and current["track_selection"] == snapshot["track_selection"]
-    )
+    assert snapshot["track_selection"]["audio_track_ids"] == [8, 4]
+    assert current["track_selection"]["audio_track_ids"] == []
+    assert current["track_selection"]["subtitle_track_ids"] == []
+    assert current["shared_track_selection"]["remux_pending"]
+    assert "retained inputs" in current["shared_track_selection"]["error"]
+    with session() as db:
+        assert db.scalar(
+            select(TrackSelection).where(TrackSelection.job_id == frozen["id"])
+        ).audio_track_ids == [8, 4]
     assert current["shared_track_selection"]["applied_revision"] == 1
     assert save(client, frozen["id"], {**CHOICES, "shared_revision": 2}).status_code == 409
     (environment.source_root / "Movie.mkv").write_bytes(b"a different source file")

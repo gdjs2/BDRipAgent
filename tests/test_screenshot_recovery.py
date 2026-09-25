@@ -136,6 +136,8 @@ def test_failed_selection_retains_verified_index_for_new_attempt(client, new_job
         job.validation = {"metrics": {"source_duration": 1000}}
         job.screenshot_policy = {
             **job.screenshot_policy,
+            "strategy": "agent",
+            "best_count": 4,
             "count": 4,
             "representative": 2,
             "encode_challenging": 2,
@@ -309,8 +311,12 @@ def test_discovery_passes_operation_phase_to_stream(
 ):
     from uuid import uuid4
 
+    from worker.adapters import subtitle_resume
     from worker.pipeline import subtitle_discovery
 
+    for method in ("recover_previous_attempts", "load"):
+        monkeypatch.setattr(subtitle_resume, method, lambda *a, **kw: None)
+    monkeypatch.setattr(subtitle_resume, "save", lambda ctx, inventory, answer: answer)
     request_context.settings.cache_root = tmp_path
     request_context.job.id = str(uuid4())
     request_context.task_id = str(uuid4())

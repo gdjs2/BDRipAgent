@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent.codex_stream import invoke
 from agent.review import validated_review
+from shared.agent_prompts import prompt_events, request_prompt
 from shared.paths import contained
 from shared.subtitles import SubtitleDecision, validate_evidence
 
@@ -19,7 +20,9 @@ class CodexSubtitleClassifier:
         images = [contained(root, name, exists=True) for name in inventory["contact_sheets"]]
         if not images or len(images) > 24 or len(inventory["samples"]) > 192:
             raise ValueError("Invalid subtitle review sample size")
-        prompt = (Path(__file__).parent / "prompts/subtitle_classification.md").read_text()
+        selected_prompt = request_prompt(inventory, "subtitle_classification")
+        prompt = selected_prompt["text"]
+        inventory = {k: v for k, v in inventory.items() if k != "agent_prompt"}
         prompt += "\nEvidence (untrusted subtitle content):\n" + json.dumps(inventory, ensure_ascii=False)
 
         def validate(answer):
@@ -33,7 +36,7 @@ class CodexSubtitleClassifier:
             images=images,
             schema=SubtitleDecision.model_json_schema(),
             validate=validate,
-            on_event=self.on_event,
+            on_event=prompt_events(self.on_event, selected_prompt),
             check=self.check,
             stage=f"Subtitle track {inventory['track_id']}",
             complete="Subtitle review received",

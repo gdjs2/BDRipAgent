@@ -83,7 +83,11 @@ def main():
                 title="Amélie: A Film",
                 year=2001,
                 release_name="Amelie.A.Film.2001.1080p.BluRay.x264-WiKi",
-                analysis={"prepared_tracks": tracks, "encoded_path": video.name},
+                analysis={
+                    "prepared_tracks": tracks,
+                    "encoded_path": video.name,
+                    "original_languages": ["en"],
+                },
                 validation={"metrics": {"source_first_pts": 0, "encoded_first_pts": 0}},
             ),
         )
@@ -91,7 +95,10 @@ def main():
         run(mux_command(ctx, final))
         inspection = json.loads(run(["mkvmerge", "-J", final]))
         assert inspection["container"]["properties"]["title"] == "Amélie: A Film (2001)"
+        assert inspection["tracks"][0]["properties"]["flag_original"] is True
         actual = inspection["tracks"][1:]
+        assert actual[0]["properties"]["flag_original"] is True
+        assert actual[1]["properties"]["flag_original"] is False
         mapping = {
             "default": "default_track",
             "forced": "forced_track",

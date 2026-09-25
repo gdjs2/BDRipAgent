@@ -1,4 +1,5 @@
 import { AgentLive } from "./AgentLive";
+import { AgentPrompts } from "./AgentPrompts";
 import { EncoderSummary } from "./EncoderSummary";
 import { JobStatus } from "./JobStatus";
 import { CpuMonitor } from "./CpuMonitor";
@@ -106,7 +107,10 @@ function App() {
         </NavLink>
         <NavLink to="/new">＋ &nbsp; New movie job</NavLink>
         <NavLink to="/queue">☷ &nbsp; Queue</NavLink>
-        <NavLink to="/agent">✦ &nbsp; Agent Live</NavLink>
+        <NavLink to="/agent" end>
+          ✦ &nbsp; Agent Live
+        </NavLink>
+        <NavLink to="/agent/prompts">✎ &nbsp; Agent prompts</NavLink>
         <div className="sidebar-foot">
           <i /> Self-hosted encoding
           <br />
@@ -131,6 +135,7 @@ function App() {
           <Route path="/new" element={<NewJob config={config.data} />} />
           <Route path="/queue" element={<QueuePage />} />
           <Route path="/agent" element={<AgentLive />} />
+          <Route path="/agent/prompts" element={<AgentPrompts />} />
           <Route
             path="/jobs/:id/*"
             element={<JobPage config={config.data} />}
@@ -568,20 +573,18 @@ function NewJob({ config }: { config: Config }) {
                 them against source subtitles, checks them, and prepares PGS
                 tracks for your review.
               </p>
-              {findSubtitles && (
-                <label>
-                  Original language codes (optional)
-                  <input
-                    value={originalLanguages}
-                    onChange={(e) => setOriginalLanguages(e.target.value)}
-                    placeholder="e.g. ko or ja,en"
-                  />
-                  <small>
-                    Leave blank for the agent to verify the movie’s original
-                    languages online. Dubbed audio is not used to guess them.
-                  </small>
-                </label>
-              )}
+              <label>
+                Original language codes (optional)
+                <input
+                  value={originalLanguages}
+                  onChange={(e) => setOriginalLanguages(e.target.value)}
+                  placeholder="e.g. ko or ja,en"
+                />
+                <small>
+                  Used for original-language track flags and subtitle searches.
+                  You can also confirm these codes in Track Selection.
+                </small>
+              </label>
             </fieldset>
             <label>
               Audio analysis maximum rounds
@@ -600,40 +603,74 @@ function NewJob({ config }: { config: Config }) {
               </small>
             </label>
             <label>
-              Best screenshot candidates
-              <input
-                type="number"
-                required
-                min="2"
-                max="40"
-                step="1"
-                value={policy.best_count ?? 20}
-                onChange={(e) =>
-                  setPolicy({ ...policy, best_count: Number(e.target.value) })
-                }
-              />
-              <small>
-                Agent recommendations per encode, before you choose the final
-                pairs. For example, review 20 and choose 7 for each codec.
-              </small>
-            </label>
-            <label>
-              Representative frames (remaining frames show encoding challenges)
-              <input
-                type="number"
-                min="0"
-                max="7"
-                value={policy.representative}
+              Screenshot selection strategy
+              <select
+                aria-label="Screenshot selection strategy"
+                value={policy.strategy ?? "local"}
                 onChange={(e) =>
                   setPolicy({
                     ...policy,
-                    count: 7,
-                    representative: +e.target.value,
-                    encode_challenging: 7 - +e.target.value,
+                    strategy: e.target.value as "local" | "agent",
                   })
                 }
-              />
+              >
+                <option value="local">
+                  Local filtering · 200 scene samples (default)
+                </option>
+                <option value="agent">
+                  Agent review · sample more until enough good choices
+                </option>
+              </select>
+              <small>
+                Local mode checks image quality and duplicates without calling
+                the agent. Best starts empty; add frames from Shortlist
+                yourself.
+              </small>
             </label>
+            {policy.strategy === "agent" && (
+              <>
+                <label>
+                  Best screenshot candidates
+                  <input
+                    type="number"
+                    required
+                    min="2"
+                    max="40"
+                    step="1"
+                    value={policy.best_count ?? 30}
+                    onChange={(e) =>
+                      setPolicy({
+                        ...policy,
+                        best_count: Number(e.target.value),
+                      })
+                    }
+                  />
+                  <small>
+                    Review 30–40 choices, then pick your final pairs, such as 7
+                    per codec. Agent mode defaults to 30 and samples additional
+                    windows when needed.
+                  </small>
+                </label>
+                <label>
+                  Representative frames (remaining frames show encoding
+                  challenges)
+                  <input
+                    type="number"
+                    min="0"
+                    max="7"
+                    value={policy.representative}
+                    onChange={(e) =>
+                      setPolicy({
+                        ...policy,
+                        count: 7,
+                        representative: +e.target.value,
+                        encode_challenging: 7 - +e.target.value,
+                      })
+                    }
+                  />
+                </label>
+              </>
+            )}
             <label>
               Screenshot scan decoder
               <select

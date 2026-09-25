@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
+import { SubtitleReviewGuidance } from "./SubtitleReviewGuidance";
 import type { DiscoveredSubtitle, Job } from "./types";
 
 function language(code: string) {
@@ -180,12 +181,18 @@ export function SubtitleDiscoveryPanel({ job }: { job: Job }) {
     },
   });
   const [originals, setOriginals] = useState(
-    state?.policy.original_languages.join(", ") ?? "",
+    job.original_languages?.map((item) => item.code).join(", ") ??
+      state?.policy.original_languages.join(", ") ??
+      "",
   );
   const active = state?.active_task;
   const latest = [...job.tasks]
     .filter((task) => task.type === "discover_subtitles")
     .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+  const reviewTaskId =
+    latest && ["FAILED", "CANCELLED"].includes(latest.status)
+      ? latest.id
+      : (state?.report?.task_id ?? latest?.id);
   const refresh = () => query.invalidateQueries({ queryKey: ["job", job.id] });
   const search = useMutation({
     mutationFn: () =>
@@ -297,6 +304,23 @@ export function SubtitleDiscoveryPanel({ job }: { job: Job }) {
         <p className="error" role="alert">
           {String(search.error ?? cancel.error ?? latest?.error_message)}
         </p>
+      )}
+      {reviewTaskId && (
+        <SubtitleReviewGuidance
+          key={reviewTaskId}
+          taskId={reviewTaskId}
+          disabled={!!active || !state.allowed}
+          canContinue={
+            !active &&
+            ((!!report?.needs_review &&
+              (!!report?.missing?.length ||
+                !!report?.candidates.some(
+                  (candidate) => candidate.status === "needs_review",
+                ))) ||
+              latest?.status === "FAILED" ||
+              latest?.status === "CANCELLED")
+          }
+        />
       )}
       {found.length > 0 && (
         <div className="discovered-track-list">

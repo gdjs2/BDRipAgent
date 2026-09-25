@@ -79,5 +79,12 @@ RUN git init /opt/sup2sup && git -C /opt/sup2sup remote add origin https://githu
     uv sync --frozen --no-dev --project /opt/sup2sup --python /usr/local/bin/python
 # Local CPU speech recognition stays separate from the media-tool Python environments.
 RUN uv venv /opt/audio-review && uv pip install --python /opt/audio-review/bin/python faster-whisper==1.2.1
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN test "$APP_UID" -gt 0 && test "$APP_GID" -gt 0 && \
+    groupadd --non-unique --gid "$APP_GID" app && \
+    useradd --non-unique --uid "$APP_UID" --gid "$APP_GID" --create-home app
+ENV HOME=/home/app PYTHONDONTWRITEBYTECODE=1
+USER app
 # Module startup keeps /app on sys.path for imports made later by worker tasks.
 CMD ["python", "-m", "celery", "-A", "worker.tasks:celery", "worker", "--loglevel=INFO", "--autoscale=8,1"]

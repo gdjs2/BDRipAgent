@@ -90,6 +90,24 @@ def main():
             "metadata_cache": str(root / "metadata.json"),
             "remote_suffix": "fixture",
         }
+        request["imdb_id"] = "tt0000001"
+        (root / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "imdb_id": "tt0000001",
+                    "metadata": {
+                        "name": "Movie",
+                        "year": 2026,
+                        "genre": "Drama",
+                        "rating": "N/A",
+                        "imdb_url": "https://www.imdb.com/title/tt0000001/",
+                        "release_date": "1999-03-31",
+                        "plot": "Fixture plot",
+                        "poster_url": "",
+                    },
+                }
+            )
+        )
         calls = []
         interrupted = False
 
@@ -149,6 +167,9 @@ def main():
         nfo = (package / (movie.stem + ".nfo")).read_bytes().decode("cp437")
         assert "SMOKE TEST - Source reused" in nfo and request["details"]["source"] in nfo
         assert request["details"]["source"] in post
+        assert "RELEASE DATE..............:[/font] 1999-03-31" in post
+        assert "RELEASE DATE.........: 1999-03-31" in nfo
+        assert result["movie_release_date"] == "1999-03-31"
         assert "Movie.2026.1080p" not in nfo
         assert "320x180" in nfo
         with patch.object(
@@ -190,6 +211,47 @@ def main():
         assert normal_post.count(custom_description) == 1
         assert not normal_result["smoke_test"] and "frame I:" in normal_post
         assert "SMOKE TEST" not in normal_post and ".x264.Info" in normal_post
+        # Date repair changes the NFO payload: repair its torrent pieces too.
+        from worker.adapters.release_date_repair import dated_text, revised_torrent
+
+        package = Path(normal_request["package_dir"])
+        nfo_file = package / f"{normal_movie.stem}.nfo"
+        torrent_file = Path(normal_request["output_dir"]) / f"{normal_movie.stem}.torrent"
+        original_hash = Torrent.read(torrent_file).infohash
+        original_video = normal_movie.read_bytes()
+        updated_nfo = dated_text(nfo_file.read_bytes(), "1977-05-25")
+        revised, pieces = revised_torrent(torrent_file, package, {nfo_file: updated_nfo})
+        assert pieces and revised.infohash != original_hash
+        nfo_file.write_bytes(updated_nfo)
+        revised.write(torrent_file, overwrite=True)
+        assert verify_torrent(torrent_file, package)
+        assert normal_movie.read_bytes() == original_video
+        assert b"1977-05-25" in dated_text(normal_post.encode(), "1977-05-25")
+        # Exercise an NFO spanning several pieces and a boundary shared with video.
+        multi = root / "multiple-pieces"
+        multi.mkdir()
+        (multi / "a.mkv").write_bytes(b"video" * 5000)
+        large_nfo = multi / "b.nfo"
+        large_nfo.write_bytes(b"RELEASE DATE.........: 1999-03-31\n" + b"." * 40000)
+        multi_torrent = root / "multiple-pieces.torrent"
+        generated = Torrent(path=multi, piece_size=16384)
+        generated.generate()
+        generated.write(multi_torrent)
+        original_pieces = generated.metainfo["info"]["pieces"]
+        changed = dated_text(large_nfo.read_bytes(), "1977-05-25")
+        updated, affected = revised_torrent(multi_torrent, multi, {large_nfo: changed})
+        assert len(affected) > 1 and 0 not in affected
+        assert updated.metainfo["info"]["pieces"][:20] == original_pieces[:20]
+        large_nfo.write_bytes(changed)
+        updated.write(multi_torrent, overwrite=True)
+        assert verify_torrent(multi_torrent, multi)
+        # Restore for the remaining publication test.
+        original_nfo = dated_text(updated_nfo, "1999-03-31")
+        revised, _ = revised_torrent(torrent_file, package, {nfo_file: original_nfo})
+        nfo_file.write_bytes(original_nfo)
+        revised.write(torrent_file, overwrite=True)
+        assert revised.infohash == original_hash
+
         from uuid import uuid4
 
         from worker.pipeline.release_exports import publish

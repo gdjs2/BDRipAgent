@@ -44,6 +44,9 @@ def reset_database_pool(**kwargs):
 def dispatch():
     with session() as db:
         reconcile(db)
+        from backend.app.screenshot_sharing import ensure_shared_screenshots
+
+        ensure_shared_screenshots(db)
         config = queue.settings(db, lock=True)
         tasks = queue.available(db, config)
         for task in tasks:
@@ -68,6 +71,11 @@ def ready(**kwargs):
         while True:
             try:
                 dispatch()
+                from worker.job_cleanup import cleanup_deleted_jobs
+                from worker.output_backups import cleanup_replaced_videos
+
+                cleanup_deleted_jobs()
+                cleanup_replaced_videos()
                 if time.monotonic() - last_cleanup >= 3600:
                     from worker.output_backups import cleanup_expired_outputs
 
@@ -126,6 +134,17 @@ def execute(task_id):
     context = None
     try:
         context = TaskContext(task_id, token)
+        if kind in {
+            "review_tracks",
+            "discover_subtitles",
+            "review_uploaded_subtitle",
+            "select_screenshots",
+            "prepare_tracks",
+            "mux",
+        }:
+            from shared.agent_prompts import task_prompts
+
+            task_prompts(context)
         result = HANDLERS[kind](context)
         context.check()
         with session() as db:
@@ -170,3 +189,10 @@ def execute(task_id):
             except Exception:
                 pass  # Logs remain addressable through the task even if artifact registration fails.
             context.close()
+        if context and kind in ("encode", "mux", "generate_release"):
+            try:
+                from worker.output_backups import cleanup_replaced_videos
+
+                cleanup_replaced_videos()
+            except Exception:
+                logging.getLogger(__name__).exception("Output cleanup will retry in the dispatch loop")

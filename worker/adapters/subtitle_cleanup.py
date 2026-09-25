@@ -1,10 +1,8 @@
 """Review every cue in bounded batches before rendering editable subtitles to PGS."""
 
-import re
-
 import pysubs2
 
-from shared.subtitle_discovery import SubtitleCleanup, covers
+from shared.subtitle_discovery import SubtitleCleanup, blocking_issues, covers, validate_cleanup_edits
 
 
 def clean_subtitles(ctx, subtitles, candidate, request, *, references=()):
@@ -67,7 +65,7 @@ def clean_subtitles(ctx, subtitles, candidate, request, *, references=()):
         if (
             review.single_language
             and covers(review.language, candidate.language)
-            and (not review.usable or review.issues)
+            and (not review.usable or blocking_issues(review))
         ):
             initial_review = review.model_dump()
             ctx.progress(
@@ -84,31 +82,20 @@ def clean_subtitles(ctx, subtitles, candidate, request, *, references=()):
             review = review.model_copy(update={"edits": list(merged.values())})
         if not review.single_language or not covers(review.language, candidate.language):
             raise ValueError("Only confidently single-language subtitles are accepted: " + review.explanation)
+        if blocking_issues(review):
+            raise ValueError("Subtitle repair needs guidance: " + "; ".join(blocking_issues(review)))
         remaining = list(review.issues)
         if not review.usable:
             remaining.append(review.explanation)
-        critical_errors.extend(f"Batch {index}: {issue}" for issue in remaining)
-        supplied = {cue["id"]: cue for cue in batch}
+        critical_errors.extend(
+            f"Batch {index}: {issue}"
+            for issue in remaining
+            if issue.lstrip().upper().startswith(("CRITICAL", "BLOCKING:"))
+        )
+        validate_cleanup_edits(review, batch)
         for edit in review.edits:
-            cue = supplied.get(edit.cue_id)
-            if cue is None or cue["text"] != edit.original_text or edit.cue_id in edits:
-                raise ValueError("Subtitle cleanup cites missing, changed or duplicate cue evidence")
-            replacement = edit.replacement_text
-            if edit.action == "correct_text":
-                if (
-                    not replacement
-                    or not replacement.strip()
-                    or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]|<[^>]*>|\{[^}]*\}", replacement)
-                ):
-                    raise ValueError("Subtitle cleanup correction must contain plain dialogue")
-            elif replacement is not None:
-                raise ValueError("Subtitle removal must not supply replacement dialogue")
-            if edit.action == "remove_duplicate" and not any(
-                other["id"] != cue["id"]
-                and all(other[key] == cue[key] for key in ("text", "start_ms", "end_ms"))
-                for other in batch
-            ):
-                raise ValueError("Subtitle duplicate removal lacks matching text and timestamps")
+            if edit.cue_id in edits:
+                raise ValueError("Subtitle cleanup cites an already edited cue")
             edits[edit.cue_id] = edit
         reviews.append({**review.model_dump(), "initial_review": initial_review})
         if candidate.language.startswith(("zh-Hans", "zh-Hant")):

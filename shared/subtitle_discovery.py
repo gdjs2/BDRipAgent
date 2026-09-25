@@ -1,5 +1,6 @@
 """Schemas and language coverage for source-shared subtitle discovery."""
 
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -138,3 +139,60 @@ class SubtitleCleanup(Strict):
     @classmethod
     def code(cls, value):
         return language_tag(value, allow_unknown=True)
+
+
+def validate_cleanup_edits(review, supplied_cues):
+    """Validate edits before agent completion, checkpointing, and application."""
+    cues = {cue["id"]: cue for cue in supplied_cues}
+    edits = {}
+    for edit in review.edits:
+        cue = cues.get(edit.cue_id)
+        if cue is None:
+            invalid = sorted({item.cue_id for item in review.edits if item.cue_id not in cues})
+            raise ValueError(
+                f"Cleanup edits include non-editable cue IDs {invalid}. "
+                f"The only editable cue IDs in this batch are {sorted(cues)}. "
+                "Remove edits for context/reference cues; those cues are reviewed in their own batch. "
+                "Keep the valid edits for this batch."
+            )
+        if edit.cue_id in edits:
+            raise ValueError(
+                f"Cue {edit.cue_id} appears more than once in edits; return one final edit per cue"
+            )
+        if cue["text"] != edit.original_text:
+            raise ValueError(
+                f"Cue {edit.cue_id}: original_text must exactly equal the supplied text "
+                f"{cue['text']!r}; put corrected dialogue only in replacement_text"
+            )
+        edits[edit.cue_id] = edit
+        replacement = edit.replacement_text
+        if edit.action == "correct_text":
+            if (
+                not replacement
+                or not replacement.strip()
+                or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]|<[^>]*>|\{[^}]*\}", replacement)
+            ):
+                raise ValueError(f"Cue {edit.cue_id}: cleanup correction must contain plain dialogue")
+        elif replacement is not None:
+            raise ValueError(f"Cue {edit.cue_id}: removal must not supply replacement dialogue")
+    for edit in review.edits:
+        if edit.action != "remove_duplicate":
+            continue
+        cue = cues[edit.cue_id]
+        if not any(
+            other["id"] != cue["id"]
+            and all(other[key] == cue[key] for key in ("text", "start_ms", "end_ms"))
+            and (other["id"] not in edits or edits[other["id"]].action == "correct_text")
+            for other in cues.values()
+        ):
+            raise ValueError(
+                f"Cue {edit.cue_id}: remove_duplicate requires another supplied cue with exactly "
+                "identical original text, start_ms and end_ms that will be retained. "
+                "Adjacent or split dialogue is not a duplicate. Do not merge cues or move dialogue "
+                "between their time intervals. Keep each cue and correct its own text separately; "
+                "undo any related merge in neighboring edits. Return the complete corrected review."
+            )
+
+
+def blocking_issues(review):
+    return [issue for issue in review.issues if issue.lstrip().upper().startswith("BLOCKING:")]

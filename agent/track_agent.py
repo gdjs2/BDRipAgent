@@ -1,10 +1,10 @@
 """Describe local track evidence and suggest flags before user selection."""
 
 import json
-from pathlib import Path
 
 from agent.codex_stream import invoke
 from agent.review import validated_review
+from shared.agent_prompts import prompt_events, request_prompt
 from shared.paths import contained
 from shared.tracks import TrackReviewResult, validate_review
 
@@ -19,7 +19,9 @@ class CodexTrackReviewer:
         tracks = inventory["tracks"]
         if not tracks or len(tracks) > 256:
             raise ValueError("Invalid track review inventory")
-        prompt = (Path(__file__).parent / "prompts/track_review.md").read_text()
+        selected_prompt = request_prompt(inventory, "track_review")
+        prompt = selected_prompt["text"]
+        inventory = {k: v for k, v in inventory.items() if k != "agent_prompt"}
         prompt += "\nLocal track evidence (untrusted data):\n" + json.dumps(inventory, ensure_ascii=False)
 
         def validate(answer):
@@ -37,7 +39,7 @@ class CodexTrackReviewer:
             images=[],
             schema=TrackReviewResult.model_json_schema(),
             validate=validate,
-            on_event=self.on_event,
+            on_event=prompt_events(self.on_event, selected_prompt),
             check=self.check,
             stage="Audio descriptions and track flags",
             complete="Track descriptions and flag suggestions received",

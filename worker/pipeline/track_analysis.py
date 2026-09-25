@@ -76,10 +76,10 @@ def await_preparation(ctx, future):
 
 def analyze_tracks(ctx, *, scan, prepare_subtitle, classify_subtitle, review_tracks):
     result = deepcopy(ctx.job.analysis)
-    if track_analysis_complete(result):
+    shared = SharedTrackAnalysis(ctx)
+    if track_analysis_complete(result) and not shared.needs_review(result):
         ctx.log("Reusing completed track analysis.")
         return lambda db, job: save_analysis(db, job, result)
-    shared = SharedTrackAnalysis(ctx)
     with source_lock(ctx, shared.root, phase="Waiting for the shared audio/subtitle analysis"):
         return analyze_shared_tracks(
             ctx,
@@ -100,6 +100,24 @@ def finish_analysis(ctx, result):
 
 def analyze_shared_tracks(ctx, shared, *, scan, prepare_subtitle, classify_subtitle, review_tracks):
     result = deepcopy(ctx.job.analysis)
+    if shared.needs_review(result):
+        # A retry under edited instructions reuses local samples/OCR, not old
+        # agent conclusions. Manual overrides are preserved on each track.
+        for track in result.get("tracks", []):
+            track.pop("track_review", None)
+            track.pop("subtitle_detection", None)
+        for key in (
+            "track_review_version",
+            "subtitle_analysis_version",
+            "audio_comparison",
+            "audio_review_round",
+            "audio_review_next",
+            "shared_track_analysis",
+        ):
+            result.pop(key, None)
+        ctx.log(
+            "Agent prompts changed; reusing prepared evidence and reviewing it with the saved instructions."
+        )
 
     def save_progress(value):
         value["track_analysis_signature"] = shared.signature

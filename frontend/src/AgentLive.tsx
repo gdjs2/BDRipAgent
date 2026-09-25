@@ -110,6 +110,9 @@ export function AgentLive() {
           <div className="eyebrow">SHARED AGENT WORKSPACE</div>
           <h1>Agent Live</h1>
           <p>Every prompt. Every response. One live conversation feed.</p>
+          <Link to="/agent/prompts" className="text-button">
+            Edit agent prompts →
+          </Link>
         </div>
         <span
           className={`agent-live-connection ${connection === "Live" ? "connected" : ""}`}
@@ -216,6 +219,13 @@ export function AgentLive() {
               <div className="agent-live-prompt">
                 <div className="agent-live-role">
                   PROMPT <span>Application → agent</span>
+                  {run.prompt_key && (
+                    <Link
+                      to={`/agent/prompts?task=${encodeURIComponent(run.prompt_key)}`}
+                    >
+                      Edit instructions · revision {run.prompt_revision ?? 0}
+                    </Link>
+                  )}
                 </div>
                 <pre>
                   {run.prompt.length > 420

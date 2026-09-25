@@ -2,7 +2,7 @@
 
 from sqlalchemy import select
 
-from backend.app.track_choices import source_key, source_peers, track_rows
+from backend.app.track_choices import original_languages, source_key, source_peers, track_rows
 from shared.models import MovieJob, SourceTrackChoices, Task
 from shared.state import TRACK_EDIT_STAGES, Stage
 from shared.subtitle_discovery import DiscoveryPolicy, missing_languages
@@ -31,7 +31,7 @@ def status(db, job):
     report = (record.data.get("subtitle_discovery") if record else None) or job.analysis.get(
         "subtitle_discovery"
     )
-    originals = policy.original_languages or (report or {}).get("original_languages", [])
+    originals = original_languages(db, job)
     active = active_discovery(db, job)
     return {
         "removal": removal_status(db, job),

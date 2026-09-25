@@ -1,6 +1,6 @@
 task_lease_seconds: 120
 command_timeout_seconds: 259200
-candidate_count: 100
+candidate_count: 200
 candidate_sample_seconds: 0.5
 candidate_window_seconds: 3.0
 candidate_attempts_per_bucket: 4
@@ -11,7 +11,8 @@ minimum_contrast: 8
 minimum_blur_score: 15
 duplicate_hash_distance: 5
 screenshots:
-  best_count: 20
+  strategy: local
+  best_count: 30
   decoder: cuda
   count: 7
   representative: 4
@@ -51,9 +52,12 @@ integrations:
     max_rounds: 6  # Hard limit; each job can override this (1–30).
     sample_seconds: 30
     cpu_threads: 2
+  subtitle_review:
+    # Uploaded subtitle cleanup, repairs, alignment, PGS conversion and queue waits.
+    max_seconds: 7200  # 2 hours; separate from subtitle discovery.
   subtitle_discovery:
     max_candidates: 9
-    max_seconds: 1800
+    max_seconds: 1800  # 30 minutes for the discovery workflow.
   subtitle_detection:
     sample_cues: 96
   sup2sup:
@@ -61,6 +65,10 @@ integrations:
     margin: 20
 agent:
   model: null
+  screenshots:
+    request_timeout_seconds: 1800  # 30 minutes per model response.
+    max_seconds: 7200  # 2 hours for selection and additional sampling.
+    max_sampling_rounds: 4  # Initial pool plus up to three fresh 100-window passes.
   subtitle_cleanup:
     model: gpt-5.6-luna
     reasoning_effort: low

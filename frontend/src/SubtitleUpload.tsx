@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, uploadSubtitle } from "./api";
+import { SubtitleReviewGuidance } from "./SubtitleReviewGuidance";
 import type { Job } from "./types";
 
 export function SubtitleUpload({
@@ -197,7 +198,10 @@ export function SubtitleUpload({
         <div className="subtitle-imports">
           <h4>Uploaded subtitle reviews</h4>
           {imports.map((item) => (
-            <div key={item.id} className="callout">
+            <div
+              key={item.id}
+              className={`callout ${["FAILED", "CANCELLED"].includes(item.status) ? "needs-input" : ""}`}
+            >
               <strong>{item.filename}</strong>{" "}
               <span
                 className={`badge ${["FAILED", "CANCELLED"].includes(item.status) ? "needs-input" : item.status === "SUCCEEDED" ? "succeeded" : "running"}`}
@@ -224,6 +228,12 @@ export function SubtitleUpload({
                   Retry review
                 </button>
               )}
+              <SubtitleReviewGuidance
+                key={item.task_id}
+                taskId={item.task_id}
+                disabled={disabled}
+                canContinue={["FAILED", "CANCELLED"].includes(item.status)}
+              />
             </div>
           ))}
           {retry.error && <p className="error">{retry.error.message}</p>}

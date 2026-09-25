@@ -1,5 +1,6 @@
 """Compare track evidence, expanding audio coverage until the agent can distinguish it."""
 
+from shared.agent_prompts import task_prompts
 from shared.config import behavior
 from shared.naming import automatic_track_name, track_name
 from shared.paths import contained, job_dir, write_json
@@ -169,6 +170,7 @@ def review_tracks(ctx, result, *, on_progress=None):
             root / "inventory.json",
             {
                 "tracks": inventory,
+                "agent_prompt": task_prompts(ctx)["track_review"],
                 "comparison_round": round_number + 1,
                 "previous_comparison": result.get("audio_comparison"),
                 "matching_mono_samples": matching_signals(inventory),

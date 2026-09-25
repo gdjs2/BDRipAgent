@@ -10,6 +10,7 @@ from backend.app.track_choices import (
     choices_current,
     seed_existing_choices,
     shared_choices_status,
+    shared_choices_view,
 )
 from shared.config import behavior, get_settings
 from shared.models import (
@@ -24,7 +25,15 @@ from shared.models import (
     now,
 )
 from shared.paths import atomic_text, job_dir
-from shared.state import HUMAN_GATES, TASK_TYPES, TRACK_EDIT_STAGES, TRACK_TASK_STATES, Stage, next_stage
+from shared.state import (
+    HUMAN_GATES,
+    POST_TRACK_STAGES,
+    TASK_TYPES,
+    TRACK_EDIT_STAGES,
+    TRACK_TASK_STATES,
+    Stage,
+    next_stage,
+)
 from shared.tracks import track_analysis_complete
 
 
@@ -50,7 +59,13 @@ def get_job(db, job_id, *, lock=False):
 
 def enqueue(db, job, *, retry_of=None, stage=None):
     stage = stage or (retry_of.stage if retry_of else job.state)
-    lane = "tracks" if stage in TRACK_TASK_STATES else "pipeline"
+    lane = (
+        "screenshots"
+        if stage == Stage.SYNCING_SCREENSHOTS
+        else "tracks"
+        if stage in TRACK_TASK_STATES
+        else "pipeline"
+    )
     if stage not in TASK_TYPES:
         raise ValueError("This stage requires a user decision or is complete")
     active = db.scalar(
@@ -154,6 +169,10 @@ def ensure_track_analysis(db, job):
 
 
 def task_is_current(job, task):
+    if task.lane == "screenshots":
+        from shared.state import SCREENSHOT_SYNC_STATES
+
+        return job.state in SCREENSHOT_SYNC_STATES
     if task.lane == "tracks":
         return job.state in TRACK_TASK_STATES.get(task.stage, set())
     return job.state == task.stage
@@ -217,6 +236,15 @@ def reconcile(db):
             and db.scalar(select(TrackSelection).where(TrackSelection.job_id == job.id))
         ):
             advance(db, job)
+    from backend.app.remux import sync_shared_choices
+
+    for job in db.scalars(
+        select(MovieJob)
+        .where(MovieJob.state.in_(POST_TRACK_STAGES), MovieJob.deleted_at.is_(None))
+        .order_by(MovieJob.id)
+        .with_for_update(skip_locked=True)
+    ):
+        sync_shared_choices(db, job)
     db.commit()
 
 
@@ -224,8 +252,12 @@ def serialize(row):
     return {column.key: getattr(row, column.key) for column in row.__table__.columns}
 
 
-def serialize_tracks(db, job):
-    from shared.naming import language_name
+def serialize_tracks(db, job, *, shared_view=None):
+    from backend.app.track_choices import original_languages
+    from shared.naming import language_name, normalize_audio_label
+    from shared.original_languages import is_original
+
+    originals = original_languages(db, job)
 
     # JSON scan order is authoritative for existing jobs; row/UUID order is not.
     scanned = {track["track_id"]: index for index, track in enumerate(job.analysis.get("tracks", []))}
@@ -238,9 +270,21 @@ def serialize_tracks(db, job):
             if isinstance(row, MovieTrack)
             else {"track_id": row.track_id, "kind": row.kind, "job_id": job.id}
         )
+        info = shared_view[1].get(row.track_id, row.info) if shared_view else row.info
+        info = {
+            **info,
+            **{
+                key: normalize_audio_label({**info, "kind": row.kind}, info[key])
+                for key in ("mux_name", "name_override", "suggested_name", "base_name")
+                if info.get(key)
+            },
+        }
         value["info"] = {
-            **row.info,
-            "language_name": language_name(row.info.get("language")),
+            **info,
+            "language_name": language_name(info.get("language")),
+            "original": is_original({**info, "kind": row.kind}, originals)
+            if originals or row.kind == "video"
+            else None,
             "source_order": row.info.get("source_order", scanned.get(row.track_id, row.track_id)),
         }
         values.append(value)
@@ -249,6 +293,12 @@ def serialize_tracks(db, job):
 
 def job_detail(db, job):
     value = serialize(job)
+    from backend.app.track_choices import original_languages
+    from shared.naming import language_name
+
+    value["original_languages"] = [
+        {"code": code, "name": language_name(code)} for code in original_languages(db, job)
+    ]
     value["analysis"] = analysis_with_release_defaults(db, job)
     if job.analysis.get("video"):
         from backend.app.encode_summary import source_bitrate
@@ -267,7 +317,8 @@ def job_detail(db, job):
 
     value["remux"] = remux_status(db, job)
     value["shared_track_selection"] = shared_choices_status(db, job)
-    value["tracks"] = serialize_tracks(db, job)
+    shared_view = shared_choices_view(db, job)
+    value["tracks"] = serialize_tracks(db, job, shared_view=shared_view)
     from backend.app.subtitle_discovery import status as discovery_status
 
     value["subtitle_discovery"] = discovery_status(db, job)
@@ -283,4 +334,10 @@ def job_detail(db, job):
     ]:
         row = db.scalar(select(model).where(model.job_id == job.id))
         value[key] = serialize(row) if row else None
+    if shared_view and value["track_selection"]:
+        value["track_selection"] = {
+            **value["track_selection"],
+            "audio_track_ids": list(shared_view[0]["audio_track_ids"]),
+            "subtitle_track_ids": list(shared_view[0]["subtitle_track_ids"]),
+        }
     return value

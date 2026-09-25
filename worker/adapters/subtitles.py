@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 
+from shared.agent_prompts import task_prompts
 from shared.config import behavior
 from shared.naming import automatic_track_name, track_name
 from shared.paths import contained, job_dir, write_json
@@ -198,7 +199,11 @@ def classify(ctx, track, source, *, require_confident=True, agent_review=False, 
         ctx.progress(None, phase=f"Reviewing subtitle track {track_id} with agent")
         # The agent receives content and coverage, never original names or flags.
         inventory = {k: v for k, v in report.items() if k != "schema_version"}
-        inventory.update(track_id=track_id, program=preliminary.model_dump())
+        inventory.update(
+            track_id=track_id,
+            program=preliminary.model_dump(),
+            agent_prompt=task_prompts(ctx)["subtitle_classification"],
+        )
         write_json(root / "inventory.json", inventory)
         try:
             answer = review(ctx, track_id)

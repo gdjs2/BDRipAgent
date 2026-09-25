@@ -430,3 +430,36 @@ def test_generation_rejects_stale_shared_release_revision(client, ready_release)
     assert response.status_code == 202
     with session() as db:
         assert db.get(MovieJob, ready_release).analysis["release_details"] == changed
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1977-05-25", "1977-05-25"),
+        ("2026", "Unknown"),
+        ("2026-02-30", "Unknown"),
+        (None, "Unknown"),
+        ("Unknown", "Unknown"),
+    ],
+)
+def test_movie_date_never_falls_back_to_packaging_day(value, expected):
+    actual, _ = release_runner.movie_release_date({}, {"release_date": value})
+    assert actual == expected
+
+
+def test_verified_movie_date_overrides_regional_metadata(tmp_path):
+    cache = tmp_path / "date.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "imdb_id": "tt0076759",
+                "release_date": "1977-05-25",
+                "source_url": "https://www.starwars.com/films/star-wars-episode-iv-a-new-hope",
+            }
+        )
+    )
+    request = {"imdb_id": "tt0076759", "release_date_cache": str(cache)}
+    date, source = release_runner.movie_release_date(request, {"release_date": "1980-07-10"})
+    assert date == "1977-05-25" and source.startswith("https://www.starwars.com/")
+    request["imdb_id"] = "tt0080684"
+    assert release_runner.movie_release_date(request, {"release_date": "1980-05-21"})[0] == "1980-05-21"

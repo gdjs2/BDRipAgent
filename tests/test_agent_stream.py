@@ -105,6 +105,9 @@ def test_codex_stream_timeout_kills_child(fake_codex, monkeypatch):
 
     monkeypatch.setattr(codex_stream.subprocess, "Popen", start)
     monkeypatch.setattr(codex_stream, "behavior", lambda: {"agent": {"timeout_seconds": 0.6}})
+    monkeypatch.setattr(
+        "agent.screenshot_agent.screenshot_selection_limits", lambda: {"request_timeout_seconds": 0.6}
+    )
     with pytest.raises(TimeoutError, match="timed out"):
         CodexScreenshotSelector()._invoke("timeout", [fake_codex])
     assert all(child.poll() is not None for child in children)
